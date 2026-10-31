@@ -25,6 +25,39 @@ run `chief kickoff <id>` manually when ready. Adoption defaults to implementatio
 `--test-first` available when requested. It creates no isolated worktree or new worker. Use the hand-off steps
 below only when the user wants a separate worker with a clean worktree.
 
+## Research tasks
+
+Hand research off with **"delegate to chief"**, rather than "adopt this session": only delegated tasks rotate
+sessions, and reading many pages fills context quickly. Research uses an ordinary task contract and delivers
+one `research/<id>/memo.md`; it needs no separate research contract format or claim database.
+
+The goal states the question, the decision it serves, the stop condition, and rejected directions. Include
+`read ~/aoe-chief/rules/research.md first`. Set `test_first` to `false` because the research plan has already
+been agreed in conversation. The only check is the memo checker shown below.
+
+Use `codex`, or `claude` only when its configured default model is a Claude model. GLM's web search returned
+stale results in the pilot. Do not use `antigravity`: every shell fetch needs approval, blocking unattended
+research. Chief uses the worker's configured default; do not add a `model` field to the contract.
+
+Example ordinary task contract (replace the repository and research id):
+
+```json
+{
+  "repo": "/absolute/path/to/the/repository",
+  "name": "Research session recovery",
+  "goal": "Read ~/aoe-chief/rules/research.md first. Question: how do agent CLIs resume sessions and compact context? Decision: should Chief session rotation use native resume? Stop condition: current official sources cover each supported CLI's resume and compaction behavior, limitations, and a recommendation with at most three reasons. Rejected directions: implementing rotation changes, surveying unrelated tools, and creating structured claim databases. Deliver research/session-recovery/memo.md, including queries tried and remaining uncertainty.",
+  "checks": ["python3 ~/aoe-chief/tools/research_check.py research/session-recovery/memo.md"],
+  "protected": ["tests"],
+  "test_first": false,
+  "tool": "codex",
+  "budget": {"rounds": 15, "hours": 4}
+}
+```
+
+Create it with `chief new --from <contract>` as below. Chief checks the memo, then its usual cross-model
+review assesses the argument and omissions. Report the task id and check; this research flow skips test
+approval. The user accepts the memo with `chief close` or sends feedback with `chief nudge`.
+
 ## 1. Decide whether the plan is ready
 Hand off only a plan the user has agreed to. If the goal, the scope or a key choice is still open, ask the user first
 instead of guessing. One task per handoff; split unrelated work into separate handoffs.

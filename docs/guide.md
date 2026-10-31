@@ -132,6 +132,19 @@ pause automation, including the request to adopt the conversation itself. Adopte
 session, files and branch untouched and sends no message. Previously tracked sessions return to plain tracking.
 `--remove-session` and `chief rotate` are refused, and `chief clean` never lists or touches adopted tasks.
 
+## Research tasks
+
+Agree on the question, the decision it serves, a stop condition and rejected directions, then say
+"delegate to chief". Research uses an ordinary delegated task with `test_first: false`; delegated sessions
+can rotate as reading fills context. The deliverable is one `research/<id>/memo.md`: a one-sentence
+conclusion, at most three reasons, and numbered sources with original quotes.
+
+The standard-library checker verifies the memo's structure and quotes against fetched pages, caching
+successes outside the repository. Sources marked `(manual)` need human review. Chief's usual reviewer
+assesses the reasoning; accept with `chief close` or send feedback with `chief nudge`.
+See the [agreed design](design.md), [research worker rules](../rules/research.md), and
+[handoff contract example](../rules/handoff.md#research-tasks).
+
 ## Decisions and acceptance tests
 
 New tasks begin with a test phase: the worker writes failing acceptance tests, commits them, and asks you to
