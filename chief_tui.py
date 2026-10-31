@@ -152,6 +152,8 @@ def entry(ch, x):
     if task.get("id"):
         detail.append(("head", L("Task {} · {} · branch {}", "任务 {} · {} · 分支 {}").format(
             task["id"], task.get("state"), task.get("branch") or git.get("branch") or "-")))
+        if task.get("adopted"):
+            detail.append(("text", L("adopted · in place", "已收编 · 原地工作")))
     if task.get("goal"):
         detail.append(("text", L("Goal: ", "目标：") + task["goal"]))
     for l, m, _ in sigs:
@@ -218,6 +220,7 @@ def entry(ch, x):
             "level": lv, "headline": sigs[0][1] if sigs else (ft.get("conclusion") or ""),
             "decision": dec, "draft": bool(dec and dec.get("draft")),
             "test_approval": test_approval,
+            "adopted": bool(task.get("adopted")),
             "protected_approval": protected_approval,
             "issues": bool(review and review.get("issues")), "detail": detail}
 
@@ -240,7 +243,9 @@ def keys_for(ch, e):
         k.append(L("n nudge", "n 指示"))
         if e["issues"]:
             k.append(L("b send back", "b 退回"))
-        k.append(L("c close", "c 验收"))
+        k.append(L("c release", "c 解除监督") if e.get("adopted") else L("c close", "c 验收"))
+    elif e and not e["task"] and e["status"] != "missing":
+        k.append(L("A adopt", "A 收编"))
     if e:
         k.append(L("o open", "o 进入"))
     return [L("N new task", "N 新任务"), L("? ask AI", "? 问 AI"), L("L log", "L 日志")] + k + [L(": command", ": 命令"), L("t tick", "t tick"),
@@ -383,9 +388,13 @@ def render(ch, st, w, h):
                        "信任此文件夹：开启 — Chief 在此仓库中替你回答 Agent 的信任文件夹提示。") if new["trust"] else
                      L("Trust this folder: OFF — You confirm it in the session, then run chief.py kickoff <id>.",
                        "信任此文件夹：关闭 — 请在会话中确认，然后运行 chief.py kickoff <id>。"))
-            detail.append(("info", trust))
+            detail.append(("info", L("adopted · in place; keep this conversation and current branch",
+                                    "原地收编；保留此对话和当前分支") if new.get("adopt") else trust))
         if new.get("contract"):
-            detail.append(("text", json.dumps(new["contract"], ensure_ascii=False, indent=2)))
+            contract = new["contract"]
+            if new.get("adopt"):
+                contract = {k: contract.get(k) for k in ("name", "goal", "checks", "protected", "scope", "budget")}
+            detail.append(("text", json.dumps(contract, ensure_ascii=False, indent=2)))
         else:
             detail.append(("text", L("Task intent: ", "任务意图：") + new.get("intent", "")))
     elif log_visible:
@@ -464,9 +473,10 @@ def render(ch, st, w, h):
             if w < 60:
                 keys = "↑↓  Enter  Tab  Esc"
         elif new["phase"] == "preview":
-            keys = L("Enter create & start  e edit  t trust: {}  Esc cancel",
+            keys = (L("Enter adopt  Esc cancel", "Enter 收编  Esc 取消") if new.get("adopt") else
+                    L("Enter create & start  e edit  t trust: {}  Esc cancel",
                      "Enter 创建并启动  e 编辑  t 信任：{}  Esc 取消").format(
-                         L("on", "开启") if new["trust"] else L("off", "关闭"))
+                         L("on", "开启") if new["trust"] else L("off", "关闭")))
         elif new["phase"] == "drafting":
             keys = L("Esc cancel", "Esc 取消")
         else:
@@ -1211,6 +1221,9 @@ class Inbox:
 
     def close_entry(self, e):
         task = self.ch.close_task(self.cfg, self.task(e))
+        if task.get("adopted"):
+            return self.ch.L("{} released; conversation left running in place",
+                             "{} 已解除监督；对话保留在原会话中运行").format(e["task"])
         if task.get("session_id") and not task.get("session_removed"):
             self.closed_tasks.put((e["task"], task.get("branch", "?")))
         message = self.ch.L("{} closed; branch {} kept", "{} 已完成；分支 {} 保留").format(e["task"], task.get("branch", "?"))
@@ -1286,6 +1299,24 @@ class Inbox:
 
     def task(self, e):
         return self.ch.load_task(e["task"])
+
+    def adopt_entry(self, e):
+        new = {"adopt": True, "phase": "drafting", "repo": e["repo"], "trust": False}
+        self.st.update(new_task=new, scroll=0, msg="")
+
+        def draft():
+            try:
+                contract = self.ch.prepare_adoption(self.cfg, e["sid"])
+                if self.st.get("new_task") is new:
+                    new.update(phase="preview", contract=contract, repo=contract["repo"])
+                return None
+            except Exception:
+                if self.st.get("new_task") is new:
+                    self.st["new_task"] = None
+                raise
+
+        if not self.job(self.ch.L("preparing adoption", "准备收编"), draft, refresh=False):
+            self.st["new_task"] = None
 
     def new_intent(self):
         e = self.selected()
@@ -1416,9 +1447,12 @@ class Inbox:
         def start():
             task = None
             try:
-                contract = self.ch.validate_draft(new["contract"])
-                task = self.ch.prepare_new_task(contract, trust=trust)
-                task = self.ch.create_task(self.cfg, task)
+                if new.get("adopt"):
+                    task = self.ch.adopt_task(self.cfg, new["contract"])
+                else:
+                    contract = self.ch.validate_draft(new["contract"])
+                    task = self.ch.prepare_new_task(contract, trust=trust)
+                    task = self.ch.create_task(self.cfg, task)
                 return self.ch.L("Started task {}", "已启动任务 {}").format(task["id"]) + (
                     ": " + task["note"] if task.get("note") else "")
             except Exception as exc:
@@ -1470,7 +1504,7 @@ class Inbox:
             if k in ("\x1b", "q"):
                 self.cancel_question()
                 return k != "q"
-            if k in ("?", ":", "N", "a", "r", "d", "n", "b", "c", "o", "t") or k in "123456789":
+            if k in ("?", ":", "N", "A", "a", "r", "d", "n", "b", "c", "o", "t") or k in "123456789":
                 self.st["msg"] = L("thinking; Esc cancels", "思考中；Esc 取消")
                 return True
         if self.execution and k == "\x1b":
@@ -1493,7 +1527,7 @@ class Inbox:
                 return False
             elif k not in ("KEY_NPAGE", "KEY_PPAGE", " "):
                 return True
-        if self.execution and k in ("?", ":", "N", "a", "r", "d", "n", "b", "c", "o", "t"):
+        if self.execution and k in ("?", ":", "N", "A", "a", "r", "d", "n", "b", "c", "o", "t"):
             self.st["msg"] = L("command running; Esc cancels", "命令运行中；Esc 取消")
             return True
         if k == "?" and not new:
@@ -1515,15 +1549,18 @@ class Inbox:
             if not new and not self.st["busy"]:
                 self.new_intent()
             return True
+        if k == "A" and not new and not self.st["busy"] and e and not e["task"] and e["status"] != "missing":
+            self.adopt_entry(e)
+            return True
         if new:
             if k == "\x1b" and new["phase"] != "starting":
                 self.cancel_new()
             elif new["phase"] == "preview" and not self.st["busy"]:
                 if k in ("\n", "\r", "KEY_ENTER"):
                     self.submit_new(new)
-                elif k == "e":
+                elif k == "e" and not new.get("adopt"):
                     return "edit"
-                elif k == "t":
+                elif k == "t" and not new.get("adopt"):
                     new["trust"] = not new["trust"]
             if k == "q" and new["phase"] != "starting":
                 self.cancel_new()
@@ -1577,8 +1614,11 @@ class Inbox:
                          lambda: self.job(L("sending back", "退回中"),
                                           lambda: self.sent(ch.nudge(self.cfg, self.task(e), None, True), L("sent back", "已退回"))))
         elif k == "c" and e and e["task"]:
-            self.confirm(L("Close {} as done and archive/stop its session (keep worktree and branch)? (y/N)",
-                           "把 {} 标记为完成并归档、停止会话（保留 worktree 和分支）？(y/N)").format(e["task"]),
+            prompt = (L("Release {} as done, leaving its conversation running in place? (y/N)",
+                        "把 {} 标记为完成并解除监督，保留对话在原会话中运行？(y/N)") if e.get("adopted") else
+                      L("Close {} as done and archive/stop its session (keep worktree and branch)? (y/N)",
+                        "把 {} 标记为完成并归档、停止会话（保留 worktree 和分支）？(y/N)"))
+            self.confirm(prompt.format(e["task"]),
                          lambda: self.job(L("closing", "验收中"), lambda: self.close_entry(e)))
         elif k == "o" and e:
             return "open"

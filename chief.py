@@ -475,6 +475,7 @@ def transcript(rec):
         state = "open"                   # the turn did not finish: still running, or interrupted
     return {"source": src, "goal": goal, "title": title,
             "last_prompt": turn[0][2] if turn and turn[0][1] == "prompt" else "",
+            "prompt_ts": turn[0][0] if turn and turn[0][1] == "prompt" else None,
             "last_reply": replies[-1] if replies else "",
             "footer": parse_footer(replies[-1]) if replies else None,
             "turn": state, "error": errors[-1] if errors else "",
@@ -728,9 +729,12 @@ def protected_content(path, hash_length=40):
 
 def scope_info(path, task, extra_ignore=()):
     """Scope/protection since base; acceptance tests may change during the test phase."""
+    if task.get("adopted"):
+        path = task["repo"]  # Adopted project paths can be subdirectories; contract paths are repo-relative.
     scope, protected = task.get("scope"), task.get("protected") or []
     testing = in_test_phase(task)
-    allowed = normalized_allowances(task) if not testing else {}
+    allowed = normalized_allowances(task) if not testing or task.get("adopted") else {}
+    inspect_states = not testing or bool(allowed)
     if not path or not (scope or protected or testing or allowed):
         return None
     pending = []
@@ -755,7 +759,7 @@ def scope_info(path, task, extra_ignore=()):
         tree_job = executor.submit(scope_tree, top, base)
         committed_job = executor.submit(scope_committed_diff, top, base, head)
         index_job = (executor.submit(call, ["git", "-C", top, "ls-files", "--stage", "-z"], timeout=15)
-                     if not testing else None)
+                     if inspect_states else None)
         pending.extend((tree_job, committed_job))
         if index_job:
             pending.append(index_job)
@@ -840,7 +844,7 @@ def scope_info(path, task, extra_ignore=()):
     def protected_pair(pair):
         return any(not ignored(n, pats) and any(under(os.path.join(top, n), d) for d in protected) for n in pair)
 
-    if not testing:
+    if inspect_states:
         # Untracked moves are not paired by Git's ordinary diff. Retain exact
         # content endpoints, including destinations outside protected directories.
         deleted = {}
@@ -897,10 +901,15 @@ def scope_info(path, task, extra_ignore=()):
             continue
         touched.append(rel(f))
         new = files[f] == "A" and os.path.relpath(f, top) not in baseline and os.path.relpath(f, top) not in renamed
-        if not testing:
+        if inspect_states:
             state = current_state(f)
-            permitted = ((record.get("kind") == "addition" and new and not test and f not in explicit) or
-                         (record.get("kind") == "state" and state["consistent"] and
+            adopted_allowance = task.get("adopted") and record.get("adoption")
+            index_matches = state["consistent"] or (adopted_allowance and
+                (state["index_hash"], state["index_mode"]) == (record.get("index_hash"), record.get("index_mode")))
+            is_addition = new or (adopted_allowance and os.path.relpath(f, top) not in baseline)
+            permitted = ((record.get("kind") == "addition" and is_addition and
+                          (adopted_allowance or (not test and f not in explicit))) or
+                         (record.get("kind") == "state" and index_matches and
                           state["hash"] == record.get("hash") and
                           ("mode" not in record or record["mode"] == state["mode"])))
             if permitted:
@@ -913,7 +922,7 @@ def scope_info(path, task, extra_ignore=()):
             violations.append(rel(f))
             if not testing:
                 (deliverables if new and not test and f not in explicit else state_changes).append(rel(f))
-    if not testing:
+    if inspect_states:
         # Renewing a moved-out protected file includes its protected endpoint so
         # the proposed exception remains intelligible even outside protection.
         for pair in pairs:
@@ -1014,7 +1023,14 @@ def all_tasks():
     return out
 
 def board_by_session():
-    return {t["session_id"]: t for t in all_tasks() if t.get("session_id")}
+    tasks = all_tasks()
+    # Released conversations return to their original tracking annotation.
+    board = {t["session_id"]: t for t in tasks if t.get("session_id") and
+             not (t.get("adopted") and t.get("state") not in ACTIVE)}
+    for t in tasks:
+        if t.get("adopted") and t.get("state") in ACTIVE and t.get("session_id"):
+            board[t["session_id"]] = t  # An adoption supersedes historical delegated records.
+    return board
 
 def find_task(prefix):
     hits = [t for t in all_tasks() if t["id"].startswith(prefix) or (t.get("session_id") or "").startswith(prefix)]
@@ -1057,13 +1073,137 @@ def create_task(cfg, prepared, draft=False):
     save_task(prepared)
     return prepared if draft else start_task(cfg, prepared, prepared.get("trust", False))
 
+
+ADOPTION_MARK = "AoE Chief: this conversation is now a supervised task"
+ADOPTION_GOAL = "Carry out the plan agreed earlier in this conversation."
+
+
+def prepare_adoption(cfg, session=None, contract=None, tid=None):
+    """Resolve and validate an in-place contract without writing state or touching the worker."""
+    if session is None:
+        if not os.environ.get("TMUX"):
+            raise RuntimeError(L("specify a session ID, or run chief adopt inside its AoE tmux session",
+                                 "请指定会话 ID，或在其 AoE tmux 会话内运行 chief adopt"))
+        name = call(["tmux", "display-message", "-p", "#S"], timeout=5).strip()
+        if name.startswith("aoe_term_"):
+            raise RuntimeError(L("aoe_term_ shells are not agent sessions; run adopt in the worker session",
+                                 "aoe_term_ shell 不是 Agent 会话；请在工作会话中运行 adopt"))
+        match = re.fullmatch(r"aoe_.+_([0-9a-fA-F]{8})", name)
+        if not match:
+            raise RuntimeError(L("the current tmux session is not an AoE agent session",
+                                 "当前 tmux 会话不是 AoE Agent 会话"))
+        session = match.group(1)
+    row = find_row(listings(cfg), session)
+    sid = row["id"]
+    rec = dict(row, **aoe_records(cfg).get(sid, {}))
+    if row.get("state") != "live" or rec.get("archived") or rec.get("trashed_at"):
+        raise RuntimeError(L("session {} is not live", "会话 {} 不是 live 状态").format(sid[:8]))
+    if rec.get("view") != "terminal":
+        raise RuntimeError(L("adopt requires a terminal session", "adopt 需要 terminal 会话"))
+    if rec.get("tool") not in ("claude", "codex", "antigravity"):
+        raise RuntimeError(L("adopt supports only claude, codex or antigravity sessions",
+                             "adopt 仅支持 claude、codex 或 antigravity 会话"))
+    if any(t.get("session_id") == sid and t.get("state") in ACTIVE for t in all_tasks()):
+        raise RuntimeError(L("an active board task already owns this session", "已有活动看板任务拥有此会话"))
+    path = rec.get("project_path")
+    if not path or not os.path.isdir(path):
+        raise RuntimeError(L("the session project path must be inside a Git repository",
+                             "会话项目路径必须位于 Git 仓库内"))
+    path = os.path.abspath(path)
+    repo = call(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=8).strip()
+    try:
+        base = call(["git", "-C", path, "rev-parse", "--verify", "HEAD^{commit}"], timeout=8).strip()
+    except RuntimeError:
+        raise RuntimeError(L("adopt requires a Git repository with at least one commit (HEAD)",
+                             "adopt 需要至少有一次提交（HEAD）的 Git 仓库"))
+    branch = call(["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"], timeout=8).strip()
+    log = transcript(rec) or {}
+    t = dict(contract or {})
+    t.setdefault("name", log.get("title") or rec.get("title") or sid[:8])
+    t.setdefault("goal", ADOPTION_GOAL)
+    if "checks" not in t:
+        t["checks"] = infer_checks(repo, base=base)
+    t.setdefault("protected", infer_protected(repo))
+    t.setdefault("test_first", False)
+    t.setdefault("autonomy", "suggest")
+    t["budget"] = dict({"rounds": 15, "hours": 4}, **(t.get("budget") or {}))
+    if not t["name"].strip() or not t["goal"].strip() or any(v <= 0 for v in t["budget"].values()):
+        raise ValueError(L("adopt needs a nonempty name and goal and positive budgets",
+                           "adopt 的名称和目标不能为空，预算必须大于零"))
+    t["id"] = tid or new_task_id(t["name"])
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", t["id"]):
+        raise ValueError(L("invalid task ID", "任务 ID 无效"))
+    if (TASKS/t["id"]).exists():
+        raise RuntimeError(L("task {} already exists", "任务 {} 已存在").format(t["id"]))
+    t.update(adopted=True, session_id=sid, repo=repo, worktree=path, branch=None if branch == "HEAD" else branch,
+             base=base, tool=rec["tool"], phase="test" if t["test_first"] else "build",
+             state="needs-you", created_at=now_utc().isoformat(), started_at=now_utc().isoformat(),
+             rounds_at_adoption=log.get("turns_total", 0))
+    # Inspect in build mode even for --test-first: pre-existing edits are user work.
+    scope = scope_info(repo, dict(t, phase="build", test_first=False), cfg.get("scope_ignore", []))
+    if t["protected"] and scope is None:
+        raise RuntimeError(L("cannot inspect pre-existing protected changes", "无法检查原有受保护改动"))
+    baseline = {entry.split("\t", 1)[1] for entry in scope_tree(repo, base).split("\0") if entry}
+    allowed = []
+    for name in (scope or {}).get("protected_touched", []):
+        state = scope["protected_states"][name]
+        if not state["hash"] or state["index_hash"] is None:
+            raise RuntimeError(L("cannot verify protected file {}; resolve conflicts first",
+                                 "无法验证受保护文件 {}；请先解决冲突").format(name))
+        if name not in baseline:
+            record = dict(path=name, kind="addition", adoption=True)
+        else:
+            record = dict(path=name, kind="state", adoption=True,
+                          **{k: state[k] for k in ("hash", "mode", "index_hash", "index_mode")})
+            peers = {p for pair in scope["protected_renames"] if name in pair for p in pair if p != name}
+            if peers:
+                record["rename_peers"] = sorted(peers)
+        allowed.append(record)
+    t["allowed"] = allowed
+    return t
+
+
+def adoption_prompt(t):
+    lines = [ADOPTION_MARK, "Task: " + t["name"], "Goal: " + t["goal"],
+             "Checks (run from {}): {}".format(t["repo"], "; ".join(t["checks"]) or "none registered"),
+             "Protected paths (repository-relative): " + (", ".join(t["protected"]) or "none"),
+             "Scope: " + (t.get("scope") or "this repository"),
+             "Keep notes in .chief/progress.md and commit work as it progresses on the current branch.",
+             "End every turn with: Conclusion / Evidence / Blockers / Next step / Decision needed.",
+             "Ask in Decision needed rather than guess when a choice needs the user's approval."]
+    lines += allowed_change_lines(t, english=True)
+    if in_test_phase(t):
+        lines += ["First write failing acceptance tests for the agreed plan, commit them, then stop.",
+                  "End with: Decision needed: approve the acceptance tests <files>.",
+                  "Only explicit approval starts implementation; feedback means revise the tests and ask again."]
+    else:
+        lines.append("Continue implementing the plan already agreed in this conversation now.")
+    return "\n".join(lines)
+
+
+def adopt_task(cfg, prepared):
+    """Revalidate a preview before saving; adopt the current session without creating one."""
+    keys = ("name", "goal", "checks", "protected", "scope", "test_first", "budget", "autonomy")
+    t = prepare_adoption(cfg, prepared["session_id"], {k: prepared[k] for k in keys if k in prepared}, prepared["id"])
+    ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+    if not CFG.exists():
+        save_cfg(cfg)
+    prepare_worktree(t["worktree"], t)
+    t["note"] = L("the agent is not ready; run chief kickoff {} when it is at its input box",
+                  "Agent 尚未就绪；回到输入框后运行 chief kickoff {}").format(t["id"])
+    save_task(t)
+    if wait_ready(cfg, t["session_id"], False, timeout=0) == "ready":
+        send_kickoff(cfg, t)
+    return t
+
 def repo_text(repo, name):
     try:
         return (Path(repo)/name).read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return ""
 
-def infer_checks(repo):
+def infer_checks(repo, base=None):
     """Infer commands from local test configuration, without executing repository code."""
     repo = Path(repo)
     pytest = (repo/"pytest.ini").is_file() or any(
@@ -1076,6 +1216,16 @@ def infer_checks(repo):
     elif (repo/"tests").is_dir():
         unittest_suite = any(re.search(r"\b(?:unittest\.)?TestCase\b", repo_text(repo, p.relative_to(repo)))
                              for p in (repo/"tests").rglob("test*.py"))
+        if not unittest_suite and base:
+            # In-place work can have temporarily rewritten the tests. Preserve
+            # the repository's established runner using its committed evidence.
+            for entry in scope_tree(str(repo), base).split("\0"):
+                name = entry.split("\t", 1)[1] if entry else ""
+                if name.startswith("tests/") and Path(name).name.startswith("test") and name.endswith(".py"):
+                    contents = call(["git", "-C", str(repo), "show", base + ":" + name], timeout=8)
+                    if re.search(r"\b(?:unittest\.)?TestCase\b", contents):
+                        unittest_suite = True
+                        break
         checks.append("python3 -m unittest discover -s tests" if unittest_suite else "python3 -m pytest")
     try:
         package = json.loads(repo_text(repo, "package.json"))
@@ -1226,7 +1376,15 @@ def approve_tests(task, files):
     head = git_head(task.get("worktree") or task["repo"])
     if not head:
         raise RuntimeError("cannot approve tests without a current commit")
-    return dict(task, phase="build", base=head,
+    if task.get("adopted"):
+        allowed = normalized_allowances(task)
+        for path in paths:
+            blob, mode = protected_content(Path(task["repo"])/path, len(head))
+            if not blob or blob == "deleted":
+                raise RuntimeError(L("cannot verify approved test {}", "无法验证已批准的测试 {}").format(path))
+            allowed[path] = dict(path=path, kind="state", hash=blob, mode=mode)
+        task = dict(task, allowed=list(allowed.values()))
+    return dict(task, phase="build", base=task["base"] if task.get("adopted") else head,
                 protected=list(dict.fromkeys((task.get("protected") or []) + paths)))
 
 def kickoff_prompt(t, resume=False):
@@ -1472,7 +1630,9 @@ def deliver(cfg, sid, text, marker):
 def send_kickoff(cfg, t):
     """Send the kickoff prompt; if delivery is not confirmed, the task needs you."""
     t["kickoff_at"] = now_utc().isoformat()
-    if deliver(cfg, t["session_id"], kickoff_prompt(t), "delegated task managed by AoE Chief"):
+    prompt = adoption_prompt(t) if t.get("adopted") else kickoff_prompt(t)
+    marker = ADOPTION_MARK if t.get("adopted") else "delegated task managed by AoE Chief"
+    if deliver(cfg, t["session_id"], prompt, marker):
         t["state"] = "running"
         t.pop("note", None)
     else:
@@ -1544,7 +1704,7 @@ def draft_reply(choice):
             "If this choice turns out to need anything outside the task boundaries, stop and ask again.").format(choice)
 
 def user_reply(text):
-    return ("Decision (from the user): {}\n"
+    return ("Decision (from the user): {}\nAoE Chief: decision delivery.\n"
             "Record it under Decisions in .chief/progress.md and continue toward the goal.").format(text)
 
 def decision_prompt(task, d, log):
@@ -1749,7 +1909,7 @@ def send_decision(cfg, d, text, resolution):
             files = approval_files(d["question"])
             if not files:
                 raise ValueError("approval needs acceptance test files")
-            wt = t.get("worktree") or t["repo"]
+            wt = t["repo"] if t.get("adopted") else t.get("worktree") or t["repo"]
             scope = scope_info(wt, t, cfg.get("scope_ignore", []))
             if scope is None:
                 raise RuntimeError(L("cannot inspect test support files for approval", "无法检查待批准的测试辅助文件"))
@@ -1895,6 +2055,8 @@ def deliver_protected_notice(cfg, notice):
         return False
     try:
         rec = aoe_records(cfg).get(notice["session"])
+        if rec and user_present(cfg, task, transcript(rec) or {}):
+            return False
         if (not rec or rec.get("archived") or rec.get("trashed_at") or
                 rec.get("state") in ("archived", "trashed", "deleted") or
                 rec.get("status") in ("running", "stopped", "missing", "deleted") or
@@ -1933,7 +2095,7 @@ def deliver_protected_notice(cfg, notice):
     return bool(ok)
 
 
-def drain_protected_notices(cfg):
+def drain_protected_notices(cfg, notified_tasks=None):
     done = []
     for task in all_tasks():
         for path in sorted((TASKS/task["id"]/"protected-notices").glob("*.json")):
@@ -1945,6 +2107,8 @@ def drain_protected_notices(cfg):
             status = protected_notice_status(identity)
             if status != "queued":
                 done.append("{} · {}".format(task["id"], protected_approval_message(identity)))
+                if notified_tasks is not None:
+                    notified_tasks.add(task["id"])
     return done
 
 
@@ -2005,6 +2169,9 @@ def preserve_progress(t, worktree):
 
 def remove_task_session(cfg, t, force=False):
     """Preserve progress, recheck safety, then let AoE trash the session/worktree."""
+    if adoption_blocks_cleanup(t):
+        raise RuntimeError(L("adopted sessions cannot be removed; close releases supervision only",
+                             "不能移除收编的会话；close 仅解除监督"))
     if not t.get("session_id"):
         raise RuntimeError(L("the task has no AoE session", "任务没有 AoE 会话"))
     path = task_worktree(cfg, t)
@@ -2069,6 +2236,9 @@ def branch_in_use(t, ignore_task_worktree=False):
         return None
 
 def branch_cleanup_plan(t, branches, ignore_task_worktree=False):
+    if t.get("adopted") or any(a.get("adopted") and a.get("repo") == t.get("repo") and
+                              a.get("branch") == t.get("branch") for a in all_tasks()):
+        return False, L("keep branch (adopted in place)", "保留分支（原地收编）")
     if not branches:
         return False, L("keep branch (default)", "保留分支（默认）")
     merged = merge_status(t)
@@ -2079,6 +2249,23 @@ def branch_cleanup_plan(t, branches, ignore_task_worktree=False):
         return False, L("keep branch (checked out or checkout status unknown)", "保留分支（已检出或检出状态未知）")
     return True, L("delete merged branch after successful removal", "成功清理后删除已合并分支")
 
+def adoption_blocks_cleanup(task):
+    """Old delegated records must not remove a session/directory subsequently adopted in place."""
+    if task.get("adopted"):
+        return True
+    path = os.path.realpath(task["worktree"]) if task.get("worktree") else None
+    for adopted in all_tasks():
+        if not adopted.get("adopted"):
+            continue
+        if task.get("session_id") and task["session_id"] == adopted.get("session_id"):
+            return True
+        if path and adopted.get("worktree"):
+            protected = os.path.realpath(adopted["worktree"])
+            if protected == path or protected.startswith(path.rstrip("/") + "/"):
+                return True
+    return False
+
+
 def clean_tasks(cfg, dry_run=False, branches=False):
     # AoE's default list includes archived sessions. Supplement its rows with
     # persisted records for older versions that omit archives from their list.
@@ -2087,6 +2274,8 @@ def clean_tasks(cfg, dry_run=False, branches=False):
         sessions[row["id"]] = dict(sessions.get(row["id"], {}), **row)
     candidates = []
     for task in all_tasks():
+        if adoption_blocks_cleanup(task):
+            continue
         rec = sessions.get(task.get("session_id"))
         if task.get("state") not in ("done", "abandoned") or rec is None:
             continue
@@ -2146,7 +2335,10 @@ def clean_tasks(cfg, dry_run=False, branches=False):
 
 def close_task(cfg, t, abandon=False, remove_session=False, force=False):
     t = dict(t)
-    if t.get("session_id") and not t.get("session_removed"):
+    if t.get("adopted") and remove_session:
+        raise RuntimeError(L("--remove-session is refused for adopted tasks; close releases supervision only",
+                             "收编任务不允许 --remove-session；close 仅解除监督"))
+    if not t.get("adopted") and t.get("session_id") and not t.get("session_removed"):
         if remove_session:
             t = remove_task_session(cfg, t, force=force)
         else:
@@ -2211,9 +2403,38 @@ def continue_prompt(ck, task=None):
 def reset_auto(t):
     t["auto"] = {"continues": 0, "sigs": [], "recoveries": 0}
 
+
+def user_present(cfg, task, log):
+    """Adopted sessions yield to a recent human prompt, measured from its start."""
+    if not task.get("adopted"):
+        return False
+    prompt = (log.get("last_prompt") or "").lstrip()
+    if not prompt or re.match(r"(?:AoE Chief\b|You are working on a delegated task managed by AoE Chief\b|"
+                              r"Decision \(from (?:AoE Chief|the user via AoE Chief))", prompt):
+        return False
+    if prompt.startswith("Decision (from the user):") and "\nAoE Chief: decision delivery.\n" in prompt:
+        return False
+    started = parse_ts(log.get("prompt_ts"))
+    if not started:
+        return False
+    resumed = parse_ts(task.get("presence_resumed_at"))
+    if resumed and started <= resumed:
+        return False
+    return (now_utc() - started).total_seconds() < cfg.get("presence_minutes", 10) * 60
+
+
+def session_user_present(cfg, task):
+    """Re-read presence immediately before automatic input; checks/readiness can take time."""
+    if not task.get("adopted"):
+        return False
+    rec = aoe_records(cfg).get(task["session_id"])
+    return bool(rec and user_present(cfg, task, transcript(rec) or {}))
+
 def act(cfg, it, t, dry=False):
     """Decide and perform the next automatic action for one board task. Returns a one-line description, or None."""
     st, log = it["status"], it.get("log") or {}
+    if user_present(cfg, t, log) or session_user_present(cfg, t):
+        return None
     if t.get("autonomy") == "observe" or t.get("state") not in ACTIVE or st in ("running", "missing", "deleted"):
         return None
     if in_test_phase(t):
@@ -2233,6 +2454,8 @@ def act(cfg, it, t, dry=False):
         if st == "stopped":
             aoe(cfg, "session", "start", t["session_id"])
         if wait_ready(cfg, t["session_id"], False, timeout=90) != "ready":
+            return None
+        if session_user_present(cfg, t):
             return None
         auto["recoveries"] = auto.get("recoveries", 0) + 1
         msg = ("AoE Chief: your previous turn ended without finishing ({}). Re-read .chief/progress.md and "
@@ -2284,7 +2507,7 @@ def act(cfg, it, t, dry=False):
         return L("auto-continue limit reached; handed to you", "达到自动继续上限，交给你")
     # Includes agy: token counts do not establish a context window; require a displayed percentage.
     used = context_used(it.get("screen"))
-    rotate = used is not None and used >= cfg.get("rotate_at", 70)
+    rotate = not t.get("adopted") and used is not None and used >= cfg.get("rotate_at", 70)
     if dry:
         return ((L("would continue in a fresh session (context {}%)", "会换新会话继续（上下文 {}%）").format(used) if rotate
                  else L("would continue", "会自动继续")) + L(" (checks {}/{})", "（检查 {}/{}）").format(ck["passed"], ck["total"]))
@@ -2299,6 +2522,13 @@ def act(cfg, it, t, dry=False):
                       + clip(str(e), 160))
     if wait_ready(cfg, t["session_id"], False, timeout=30) != "ready":
         return None
+    if session_user_present(cfg, t):
+        # Do not consume this turn if human input arrived while waiting for the prompt.
+        auto.pop("last_turn", None)
+        auto["continues"] -= 1
+        auto["sigs"] = sigs[:-1]
+        save_task(t)
+        return None
     ok = deliver(cfg, t["session_id"], continue_prompt(ck, t), CONTINUE_MARK)
     t["state"] = "running" if ok else "needs-you"
     if not ok:
@@ -2310,6 +2540,9 @@ def act(cfg, it, t, dry=False):
 
 def rotate_task(cfg, t, it, reason):
     """Start a fresh session in the same worktree that continues from progress.md; stop (but keep) the old one."""
+    if t.get("adopted"):
+        raise RuntimeError(L("cannot rotate an adopted task; its conversation stays in place",
+                             "不能轮换收编任务；对话必须保留在原会话中"))
     old, turns = t["session_id"], (it.get("log") or {}).get("turns_total", 0)
     title = "{} #{}".format(t["name"][:54], len(t.get("past_sessions", [])) + 2)   # AoE rejects a duplicate title + path
     cmd = [aoe_bin(), "-p", cfg["profile"], "add", t["worktree"], "-t", title, "--tool", t["tool"], "--launch"]
@@ -2377,7 +2610,8 @@ fail = does not meet the goal, games the checks (for example special-casing test
 
 def review_task(cfg, t, it):
     """Once all checks pass, have another model review the changes against the contract; writes tasks/<id>/review.md."""
-    wt, head = t["worktree"], (it.get("git") or {}).get("head")
+    wt = t["repo"] if t.get("adopted") else t["worktree"]
+    head = (it.get("git") or {}).get("head")
     base = t.get("base") or "HEAD"
     stat = call(["git", "-C", wt, "diff", "--stat", base], timeout=20)
     diff = call(["git", "-C", wt, "diff", base], timeout=20)
@@ -2388,7 +2622,7 @@ def review_task(cfg, t, it):
     body = stat + ("\n(diff truncated)\n" + diff[:60000] if len(diff) > 60000 else "\n" + diff)
     if untracked:
         body += "\nUntracked files: " + ", ".join(untracked[:30])
-    prog_p = Path(wt)/".chief"/"progress.md"
+    prog_p = Path(t["worktree"])/".chief"/"progress.md"
     prog = prog_p.read_text(encoding="utf-8", errors="replace") if prog_p.exists() else ""
     engine = cfg.get("review_engine") or ("claude" if t.get("tool") == "codex" else "codex")   # never self-review
     spec = pick_model(cfg, engine, cfg.get("review_level", 2))
@@ -2437,7 +2671,12 @@ def nudge(cfg, t, text=None, with_review=False):
     if wait_ready(cfg, t["session_id"], False, timeout=30) != "ready":
         raise RuntimeError(L("the session cannot take input now: run aoe session start {} or check the session",
                              "会话现在不能输入：先 aoe session start {} 或进入会话处理").format(t["session_id"][:8]))
+    if t.get("adopted"):
+        parts.insert(0, "AoE Chief: the user asked to resume supervision.")
+    sent_at = now_utc().isoformat()
     ok = deliver(cfg, t["session_id"], "\n\n".join(parts), parts[0][:40])
+    if ok and t.get("adopted"):
+        t["presence_resumed_at"] = sent_at
     if text:                             # the reviewer must know what you asked for, or it flags it as out of contract
         t.setdefault("nudges", []).append({"at": now_utc().isoformat(), "text": text})
     t.pop("note", None)
@@ -2463,12 +2702,15 @@ def tick(cfg, dry=False):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (ImportError, OSError):
             return [L("another tick is running; skipped", "另一个 tick 正在运行，跳过")]
-        done = [] if dry else drain_protected_notices(cfg)
+        notified_tasks = set()
+        done = [] if dry else drain_protected_notices(cfg, notified_tasks)
         result = collect(cfg, state_file=TICK)
         for it in result["items"]:
             t = it["task"]
             if not t.get("id"):
                 continue
+            if t.get("adopted") and t["id"] in notified_tasks:
+                continue  # A queued decision notice already resumed this worker during this tick.
             try:
                 what = act(cfg, it, load_task(t["id"]), dry)
             except RuntimeError as e:
@@ -2540,6 +2782,9 @@ def collect(cfg, checks=True, persist=True, state_file=LAST):
             ckcache[sid] = it["checks"]
         it["events"] = events_since(task, prev.get("generated_at"))
         it["signals"] = judge(it)
+        if user_present(cfg, task, log):
+            it["signals"].append(("yellow", L("automation paused: user active in this conversation",
+                                                  "自动操作已暂停：用户正在此对话中活动"), "presence"))
         if task.get("id") and task.get("state") in ACTIVE:
             dec = sync_decisions(cfg, task, it)
             if dec:                      # a drafted small decision goes from "needs your thought" to "needs your nod"
@@ -2605,7 +2850,8 @@ def pick_checks(cfg, it, prev, allowed):
             return dict(old, cached=True, stale=True)    # may be out of date: always rerun at the next chance
         return {"cmds": cmds, "skipped": L("running; check later", "运行中，稍后再检查") if it["status"] == "running"
                 else L("skipped this time", "本次跳过")}
-    return dict(run_checks(it["path"], cmds, cfg.get("check_timeout", 300)), fp=it["fingerprint"])
+    path = it["task"]["repo"] if it["task"].get("adopted") else it["path"]
+    return dict(run_checks(path, cmds, cfg.get("check_timeout", 300)), fp=it["fingerprint"])
 
 def judge(it):
     """Deterministic rules. Each signal is (level, message, kind): red = needs you; green = checks pass, ready to
@@ -2664,6 +2910,8 @@ def judge(it):
         if used > b["hours"]:
             s.append(("red", L("over the time budget ({:.1f}/{} hours)", "超出时间预算（{:.1f}/{} 小时）").format(used, b["hours"]), "budget"))
     rounds = log.get("turns_total", 0) + task.get("rounds_before", 0)     # add the turns of rotated-out sessions
+    if task.get("adopted"):
+        rounds = max(0, rounds - task.get("rounds_at_adoption", 0))
     if b.get("rounds") and task.get("kickoff_at") and rounds > b["rounds"]:
         s.append(("red", L("over the turn budget ({}/{} turns)", "超出轮数预算（{}/{} 轮）").format(rounds, b["rounds"]), "budget"))
     rv = task.get("review")
@@ -2940,7 +3188,7 @@ def show(cfg, sid, n):
 
 # ---------- CLI ----------
 
-CHIEF_COMMANDS = ("tasks", "show", "new", "decide", "nudge", "close", "clean", "track", "untrack", "tick")
+CHIEF_COMMANDS = ("tasks", "show", "new", "adopt", "decide", "nudge", "close", "clean", "track", "untrack", "tick")
 SESSION_COMMANDS = ("show", "start", "stop", "archive", "unarchive", "restore")
 
 
@@ -3317,6 +3565,23 @@ def argument_parser(parser_class=argparse.ArgumentParser, selected=None):
     nw.add_argument("--draft", action="store_true", help=L("save the contract only; do not start", "只保存合同，不启动"))
     nw.add_argument("--dry-run", action="store_true", help=L("only print the contract, the aoe command and the kickoff prompt",
                                                              "只打印合同、aoe 命令和开场指令"))
+    ad = command("adopt", help=L("supervise an existing conversation in place, keeping its context and branch",
+                                 "原地监督现有对话，保留上下文和当前分支"))
+    ad.add_argument("session", nargs="?", help=L("session ID/prefix; default: current AoE tmux session",
+                                                "会话 ID 或前缀；默认当前 AoE tmux 会话"))
+    ad.add_argument("--name")
+    ad.add_argument("--goal")
+    ad.add_argument("--check", action="append", dest="checks", metavar="CMD")
+    ad.add_argument("--protected", action="append", metavar="PATH")
+    ad.add_argument("--scope")
+    ad.add_argument("--test-first", action="store_true", help=L("require acceptance-test approval before building",
+                                                              "实现前要求批准验收测试"))
+    ad.add_argument("--rounds", type=int)
+    ad.add_argument("--hours", type=float)
+    ad.add_argument("--autonomy", choices=["observe", "suggest", "auto"])
+    ad.add_argument("--id", dest="tid")
+    ad.add_argument("--dry-run", action="store_true", help=L("print the contract and adoption notice without changes",
+                                                             "打印合同和收编通知，不做任何修改"))
     command("tasks", help=L("the task board", "任务看板"))
     ko = command("kickoff", help=L("start a draft task, or resend the kickoff to a ready session",
                                           "（重新）启动草稿任务，或给已就绪的会话补发开场指令"))
@@ -3471,7 +3736,8 @@ def main(argv=None):
     selected = argv[0] if argv and not argv[0].startswith("-") else None
     args = cli_parser(LANG, selected).parse_args(argv)
     try:
-        cfg = load_json(CFG, {"profile": "main"}) if args.command == "clean" else config()
+        cfg = (load_json(CFG, {"profile": "main", "tracked_ids": [], "tasks": {}})
+               if args.command in ("clean", "adopt") else config())
         if args.command == "init":
             print(L("Initialized {}. Pick sessions with sessions / track, or create a task with new.",
                     "已初始化 {}，请用 sessions / track 选择要监督的 Session，或用 new 立项").format(CFG))
@@ -3510,6 +3776,21 @@ def main(argv=None):
                     cfg["tracked_ids"].append(sid)
                 print(L("Tracking: {} ({})", "跟踪中：{} ({})").format(row.get("title"), sid[:8]))
             save_cfg(cfg)
+        elif args.command == "adopt":
+            contract = {k: getattr(args, k) for k in ("name", "goal", "checks", "protected", "scope",
+                                                     "test_first", "autonomy") if getattr(args, k) is not None}
+            contract["budget"] = {k: v for k, v in (("rounds", args.rounds), ("hours", args.hours)) if v is not None}
+            t = prepare_adoption(cfg, args.session, contract, args.tid)
+            if args.dry_run:
+                print(json.dumps(t, ensure_ascii=False, indent=2))
+                print("\n" + adoption_prompt(t))
+                return 0
+            t = adopt_task(cfg, t)
+            print(L("Adopted task {} · {} · session {} · in place at {}",
+                    "已收编任务 {} · {} · 会话 {} · 原地路径 {}").format(
+                        t["id"], t["state"], t["session_id"][:8], t["worktree"]))
+            if t.get("note"):
+                print(L("Needs you: ", "需要你：") + t["note"])
         elif args.command == "new":
             t = json.loads(Path(args.from_file).read_text(encoding="utf-8")) if args.from_file else {}
             for k in ("repo", "name", "goal", "checks", "scope", "protected", "milestones", "small_decisions",
@@ -3566,7 +3847,8 @@ def main(argv=None):
             if t["state"] == "draft" or not t.get("session_id"):
                 t = start_task(cfg, t, args.trust)
             else:
-                ready = wait_ready(cfg, t["session_id"], args.trust, timeout=30)
+                ready = wait_ready(cfg, t["session_id"], False if t.get("adopted") else args.trust,
+                                   timeout=0 if t.get("adopted") else 30)
                 if ready == "update":
                     raise RuntimeError(codex_update_note(cfg, t))
                 if ready != "ready":

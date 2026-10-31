@@ -14,6 +14,7 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `scope_ignore` | `[]` | Extra patterns the scope and cleanup cleanliness checks ignore |
 | `decision_ai` | `false` | Let AI re-judge and draft new decisions |
 | `stuck_after`, `max_auto_continues`, `rotate_at` | 3, 8, 70 | Automation limits |
+| `presence_minutes` | 10 | Adopted tasks pause automatic messages while their latest human prompt is less than this many minutes old; `nudge` resumes immediately. Delegated tasks are unaffected |
 | `review`, `review_engine`, `review_level` | `true`, the other engine (Codex for Antigravity), 2 | Cross review using Codex or Claude |
 | `aoe_colors` | `true` | Mirror each task's state onto its AoE color dot: red needs you, amber working, green to accept |
 | `commands` | `{}` | Launch a tool through your own command, e.g. `{"claude": "claude-proxy"}`. See below |
@@ -57,7 +58,7 @@ is safe:
 - each session keeps the command it was started with, including across restarts and resumes;
 - Chief can track a session opened directly in AoE, because it reads the transcript, which does not depend on how
   the agent was launched;
-- if Chief rotates such a session, the successor starts through Chief's command. Work carries over through the
+- if Chief rotates a delegated session, the successor starts through Chief's command. Adopted sessions never rotate. Work carries over through the
   progress file as usual; only the endpoint changes (with a model router, for example, routed models become
   available).
 

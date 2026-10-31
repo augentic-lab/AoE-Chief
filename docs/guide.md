@@ -12,7 +12,7 @@
   goal changes and the like) are always yours.
 - **🔁 Auto-continue:** when checks fail, Chief sends the failing output back to the agent. It recovers
   interrupted turns and detects stuck loops.
-- **♻️ Fresh context:** when a session's context fills up, a new session picks up from `.chief/progress.md`.
+- **♻️ Fresh context:** delegated sessions rotate when context fills up; adopted conversations stay in place.
 - **🔍 Cross-model review:** Codex's work is reviewed by Claude and vice versa; Antigravity workers are reviewed
   by Codex by default. Every review produces a review card.
 - **🧾 Learns your taste:** every override is written to `preferences.md`, and acceptance rates show what could
@@ -39,7 +39,7 @@ flowchart LR
 Design principles:
 
 1. **Read-only by default.** Chief reads AoE state, the agents' native transcripts, the tmux screen and git. It
-   acts only on tasks you created with `chief new`.
+   acts only on tasks you created with `chief new` or `chief adopt`.
 2. **Rules before AI.** Deterministic rules decide what needs you. AI writes briefs, optionally drafts decisions,
    and reviews finished work.
 3. **Untrusted by default.** Transcripts, screens and diffs are data, never instructions, in every AI prompt.
@@ -90,6 +90,44 @@ The Chief command is: python3 ~/aoe-chief/chief.py
 ```
 
 Adjust the paths if Chief lives elsewhere.
+
+### Adopting an agreed plan in the same conversation
+
+Use `chief adopt` when you and an agent have agreed on a plan and want that conversation to implement it under
+supervision. Adoption keeps its context and works in place on the current branch, with **no isolation**.
+A hand-off with `chief new` gives a fresh worker a clean worktree and its own branch; the original conversation
+stays available for other topics.
+
+```bash
+chief adopt <session-id> --name "Parser fix" --goal "Implement our agreed parser plan" \
+  --check "python3 -m unittest discover -s tests"
+chief adopt --dry-run            # inside the agent's AoE tmux session: preview without changes
+chief watch --every 300          # drives adopted tasks through the same checks and review loop
+```
+
+The session must be live, use a terminal with Claude, Codex or Antigravity, and have a project path inside a Git
+repository with a commit. Another active board task must not own it. Omit the session ID only from that agent's
+AoE tmux session; `aoe_term_` shells are refused. A tracked conversation can also be adopted using **A** in the Inbox.
+
+Chief infers checks and protected test directories. The default goal is to carry out the plan agreed earlier in
+the conversation; the default budget is 15 rounds and 4 hours. Adoption starts implementation immediately unless
+you opt into `--test-first`. A short notice asks the agent to continue the existing plan, commit progress, keep
+`.chief/progress.md`, and use the closing block. If it is busy or showing a menu, Chief saves the task as needs-you;
+run `chief kickoff <id>` once it is at its input box to send the adoption notice.
+
+Existing uncommitted work is included in the review and scope scan. Pre-existing protected changes are recorded
+as user-approved exceptions: existing files by exact content state, new files by exact path. Further changes to
+an approved existing file need renewed approval. Contract paths and checks use the Git repository root even if
+the session's project path is a subdirectory. Chief creates no new worktree, branch or session.
+With `--test-first`, approving tests locks those files while retaining the adoption commit as the review base.
+
+You can type directly into an adopted conversation. Automatic messages pause for `presence_minutes` (default 10)
+after the latest human prompt starts; the brief and Inbox show that the user is active. They resume automatically
+when the window expires, or immediately with `chief nudge <id>`. Adopted tasks never rotate to fresh sessions.
+
+`chief close <id>` releases supervision and marks the task done; `--abandon` marks it abandoned. It leaves the
+session, files and branch untouched and sends no message. Previously tracked sessions return to plain tracking.
+`--remove-session` and `chief rotate` are refused, and `chief clean` never lists or touches adopted tasks.
 
 ## Decisions and acceptance tests
 
@@ -167,6 +205,8 @@ allowances never unlock them. This approval flow is disabled during the test pha
 support-file review and explicit approval transition to build remain unchanged.
 
 ## Closing and cleaning tasks
+
+These archive and cleanup operations apply to delegated tasks. For adopted tasks, close means release, as above.
 
 `chief close <id>` marks a task done and runs `aoe session archive` to stop its process. The archived session
 record, worktree, branch and `.chief/progress.md` stay available. Add `--abandon` to mark it abandoned instead.

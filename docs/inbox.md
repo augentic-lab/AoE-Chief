@@ -62,6 +62,17 @@ After confirming startup, let it finish; if startup fails, use the reported task
 
 For Codex startup interruptions, see [the update menu](agents.md#codex).
 
+#### Adopting a tracked conversation
+
+Select a tracked session without an active board task and press **A adopt**. Chief shows the inferred name, goal,
+checks and protected paths. **Enter** adopts that session in place; **Esc** cancels without creating a task or
+sending anything. It keeps the current branch and conversation context. Use `chief adopt` flags for a custom contract.
+
+The task card says **adopted · in place**, and its close key becomes **c release**. Releasing leaves the session
+running and never offers session/worktree cleanup. Previously tracked sessions return to Thinking sessions.
+If you type directly into an adopted session, its card shows that automation is paused while you are active;
+the pause expires automatically after `presence_minutes` (default 10), or you can use a nudge to resume immediately.
+
 #### Task actions
 
 The list separates **Delegated tasks** from tracked **Thinking sessions**, with urgent items first within each

@@ -6,6 +6,22 @@ for the user, and has a second model review the result. The user only answers de
 
 Read this file when the user asks you to hand work off to Chief ("交给 chief", "delegate to chief", "hand this off").
 
+## Adopt this conversation
+
+When the user says “adopt this session” or “收编”, run `chief adopt` from your own shell with **no session argument**.
+Chief resolves your current AoE tmux session and supervises this conversation in place, keeping its context and
+current branch. Pass `--name`, `--goal` and repeated `--check` flags from the plan already agreed with the user:
+
+```bash
+chief adopt --name "Parser fix" --goal "Implement our agreed parser plan" \
+  --check "python3 -m unittest discover -s tests"
+```
+
+Report the returned task ID and any needs-you note. If you are busy, Chief leaves the adoption notice pending;
+the user runs `chief kickoff <id>` once you are at your input box. Adoption defaults to implementation, with
+`--test-first` available when requested. It creates no isolated worktree or new worker. Use the hand-off steps
+below only when the user wants a separate worker with a clean worktree.
+
 ## 1. Decide whether the plan is ready
 Hand off only a plan the user has agreed to. If the goal, the scope or a key choice is still open, ask the user first
 instead of guessing. One task per handoff; split unrelated work into separate handoffs.

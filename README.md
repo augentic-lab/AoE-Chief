@@ -124,6 +124,7 @@ chief close shop-demo           # or: chief nudge shop-demo "also format prices 
 | Command | Use it to |
 |---|---|
 | `chief new "Fix the parser"` | Delegate a task with checks and a worker session |
+| `chief adopt <session>` | Supervise an agreed plan in the existing conversation, in place |
 | `chief watch --every 300` | Keep checks, continuation and reviews running |
 | `chief inbox` | Handle questions, test approvals and reviews |
 | `chief decide <decision-id> --accept` | Approve pending tests or accept a drafted decision |
