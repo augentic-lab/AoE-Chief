@@ -85,7 +85,7 @@ worker starts in its own worktree with the usual test-first approval.
 Agents learn this from one line in their global instructions (installed in the [quick start](../README.md#-quick-start)):
 
 ```text
-When I ask you to hand work off to AoE Chief, read ~/aoe-chief/rules/handoff.md and follow it.
+When I ask you to hand work off to AoE Chief or to adopt this conversation into it (收编), read ~/aoe-chief/rules/handoff.md and follow it.
 The Chief command is: python3 ~/aoe-chief/chief.py
 ```
 

@@ -4,7 +4,8 @@ AoE Chief supervises AI coding agents running in Agent of Empires. A delegated t
 and worker session; Chief runs the task's checks after every turn, sends failures back, queues the worker's questions
 for the user, and has a second model review the result. The user only answers decisions and accepts the work.
 
-Read this file when the user asks you to hand work off to Chief ("交给 chief", "delegate to chief", "hand this off").
+Read this file when the user asks you to hand work off to Chief ("交给 chief", "delegate to chief", "hand this off")
+or to adopt this conversation ("收编", "adopt this session").
 
 ## Adopt this conversation
 
