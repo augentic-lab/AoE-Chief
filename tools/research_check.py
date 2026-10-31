@@ -2,7 +2,8 @@
 """Check a research memo's structure and verbatim quotations; never use a model.
 
 Usage: research_check.py path/to/memo.md [--refresh]
-main(argv=None, fetcher=None) accepts a fetcher(url) returning extracted text.
+main(argv=None, fetcher=None, clock=None) accepts a fetcher(url) returning extracted
+text and a monotonic clock() returning seconds, both injectable for offline tests.
 """
 import argparse
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from urllib.parse import quote, urljoin, urlsplit
 import urllib.request
 
@@ -28,6 +30,8 @@ import urllib.request
 TIMEOUT = 15
 MAX_BYTES = 5 * 1024 * 1024
 MAX_FETCHES = 20
+RUN_BUDGET = 240
+SUMMARY_LIMIT = 360
 PUNCTUATION = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'",
                            "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "―": "-"})
 
@@ -274,7 +278,7 @@ def id_list(ids):
     return result
 
 
-def report(errors, sources=None, verified=0, manual=None, pending=0):
+def report(errors, sources=None, verified=0, manual=None, pending=0, diagnostics=None):
     if errors or pending:
         parts = [reason + (" " + id_list(ids) if ids else "") for reason, ids in sorted(errors.items())]
         if pending:
@@ -282,10 +286,21 @@ def report(errors, sources=None, verified=0, manual=None, pending=0):
         summary = "FAIL: "
         for part in parts:
             separator = "" if summary == "FAIL: " else "; "
-            if len(summary) + len(separator) + len(part) > 775:
+            if len(summary) + len(separator) + len(part) > SUMMARY_LIMIT:
                 summary += "; more violations"
                 break
             summary += separator + part
+        if diagnostics is None:
+            diagnostics = ["[{}] {}".format(source_id, reason) if source_id is not None else reason
+                           for reason, ids in sorted(errors.items()) for source_id in (sorted(ids) if ids else [None])]
+        # Reserve the summary and its newline first; diagnostic text must never
+        # affect the deterministic summary or push it out of Chief's retained tail.
+        remaining = 799 - len(summary) - 1
+        for line in diagnostics[:10]:
+            if len(line) + 1 > remaining:
+                break
+            print(line)
+            remaining -= len(line) + 1
         print(summary)
         return 1
     manual = manual or set()
@@ -299,7 +314,9 @@ class Arguments(argparse.ArgumentParser):
         raise CheckFailure("invalid arguments")
 
 
-def main(argv=None, fetcher=None):
+def main(argv=None, fetcher=None, clock=None):
+    clock = clock or time.monotonic
+    started = clock()
     parser = Arguments(prog="research_check.py", description=__doc__.splitlines()[0])
     parser.add_argument("memo", help="path to memo.md")
     parser.add_argument("--refresh", action="store_true", help="refetch cached pages")
@@ -314,10 +331,21 @@ def main(argv=None, fetcher=None):
     except (OSError, UnicodeError):
         return report({"unreadable memo": set()})
     body, sources, citations, duplicates, has_sources = parse_memo(text)
-    errors = {}
+    errors, diagnostics = {}, []
 
-    def fail(reason, ids=()):
+    def detail(reason, ids=(), quote_text=None):
+        for source_id in (sorted(ids) if ids else [None]):
+            if len(diagnostics) >= 10:
+                break
+            line = "[{}] {}".format(source_id, reason) if source_id is not None else reason
+            if quote_text is not None:
+                snippet = " ".join("".join(char if char.isprintable() else " " for char in quote_text).split())[:60]
+                line += ": " + snippet
+            diagnostics.append(line)
+
+    def fail(reason, ids=(), quote_text=None):
         errors.setdefault(reason, set()).update(ids)
+        detail(reason, ids, quote_text)
 
     if not re.search(r"^(?:Conclusion:|结论：)[ \t]*\S[^\n]*$", body, re.M):
         fail("missing conclusion")
@@ -339,7 +367,7 @@ def main(argv=None, fetcher=None):
         if not source["quotes"]:
             fail("missing quote", [source_id])
     if any(reason in errors for reason in ("invalid source", "missing quote", "duplicate source")):
-        return report(errors)
+        return report(errors, diagnostics=diagnostics)
     fetched, attempts, verified, manual, pending = {}, 0, 0, set(), set()
     for source_id, source in sorted(sources.items()):
         url, quotes = source["url"], source["quotes"]
@@ -351,8 +379,9 @@ def main(argv=None, fetcher=None):
             page = None if args.refresh else cached_text(path, url)
             failure = None
             if page is None:
-                if attempts >= MAX_FETCHES:
+                if attempts >= MAX_FETCHES or clock() - started >= RUN_BUDGET:
                     pending.add(url)
+                    detail("source not fetched yet; rerun", [source_id])
                     continue
                 attempts += 1
                 try:
@@ -373,8 +402,8 @@ def main(argv=None, fetcher=None):
             if normalize(quote_text) in page:
                 verified += 1
             else:
-                fail("quote not found", [source_id])
-    return report(errors, sources, verified, manual, len(pending))
+                fail("quote not found", [source_id], quote_text)
+    return report(errors, sources, verified, manual, len(pending), diagnostics)
 
 
 if __name__ == "__main__":
