@@ -18,7 +18,9 @@ chief adopt --name "Parser fix" --goal "Implement our agreed parser plan" \
 ```
 
 Report the returned task ID and any needs-you note. If you are busy, Chief leaves the adoption notice pending;
-the user runs `chief kickoff <id>` once you are at your input box. Adoption defaults to implementation, with
+the next tick sends it automatically once you are at your input box with no menu. The request that triggered
+adoption does not activate the user-presence pause; new human prompts after adoption still do. The user may also
+run `chief kickoff <id>` manually when ready. Adoption defaults to implementation, with
 `--test-first` available when requested. It creates no isolated worktree or new worker. Use the hand-off steps
 below only when the user wants a separate worker with a clean worktree.
 

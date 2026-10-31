@@ -44,7 +44,9 @@ inferred checks and protected test directories; 15 rounds / 4 hours; `suggest` a
 paths are repository-relative; checks run at the Git root. Existing dirty work is included in scope and review,
 with existing protected changes recorded as exact state/path allowances. No new worktree, branch or session is created.
 
-`chief kickoff <id>` resends the adoption notice when a busy/menu session becomes ready. `chief nudge` immediately
+If adoption happens while the session is busy, `tick` sends the pending notice once its input box is ready,
+with no menu and no active human prompt since adoption. An attempted notice is never automatically resent;
+use `chief kickoff <id>` to resend it after inspecting uncertain delivery. `chief nudge` immediately
 resumes supervision after human activity. `chief close` releases an adopted task without stopping, archiving or
 messaging the session; `--abandon` releases it as abandoned. `--remove-session` and `rotate` are refused for adopted
 tasks. `clean`, including `--branches`, excludes them completely.

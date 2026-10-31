@@ -113,7 +113,9 @@ Chief infers checks and protected test directories. The default goal is to carry
 the conversation; the default budget is 15 rounds and 4 hours. Adoption starts implementation immediately unless
 you opt into `--test-first`. A short notice asks the agent to continue the existing plan, commit progress, keep
 `.chief/progress.md`, and use the closing block. If it is busy or showing a menu, Chief saves the task as needs-you;
-run `chief kickoff <id>` once it is at its input box to send the adoption notice.
+the next tick sends the pending notice automatically once it is at its input box with no menu and no active
+human prompt. You can also run `chief kickoff <id>` manually when ready. Unconfirmed delivery requires manual
+inspection and kickoff; Chief does not automatically resend a notice it has already attempted.
 
 Existing uncommitted work is included in the review and scope scan. Pre-existing protected changes are recorded
 as user-approved exceptions: existing files by exact content state, new files by exact path. Further changes to
@@ -123,7 +125,8 @@ With `--test-first`, approving tests locks those files while retaining the adopt
 
 You can type directly into an adopted conversation. Automatic messages pause for `presence_minutes` (default 10)
 after the latest human prompt starts; the brief and Inbox show that the user is active. They resume automatically
-when the window expires, or immediately with `chief nudge <id>`. Adopted tasks never rotate to fresh sessions.
+when the window expires, or immediately with `chief nudge <id>`. Prompts that started before adoption do not
+pause automation, including the request to adopt the conversation itself. Adopted tasks never rotate to fresh sessions.
 
 `chief close <id>` releases supervision and marks the task done; `--abandon` marks it abandoned. It leaves the
 session, files and branch untouched and sends no message. Previously tracked sessions return to plain tracking.

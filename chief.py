@@ -1138,6 +1138,7 @@ def prepare_adoption(cfg, session=None, contract=None, tid=None):
     t.update(adopted=True, session_id=sid, repo=repo, worktree=path, branch=None if branch == "HEAD" else branch,
              base=base, tool=rec["tool"], phase="test" if t["test_first"] else "build",
              state="needs-you", created_at=now_utc().isoformat(), started_at=now_utc().isoformat(),
+             presence_resumed_at=now_utc().isoformat(),
              rounds_at_adoption=log.get("turns_total", 0))
     # Inspect in build mode even for --test-first: pre-existing edits are user work.
     scope = scope_info(repo, dict(t, phase="build", test_first=False), cfg.get("scope_ignore", []))
@@ -1190,8 +1191,9 @@ def adopt_task(cfg, prepared):
     if not CFG.exists():
         save_cfg(cfg)
     prepare_worktree(t["worktree"], t)
-    t["note"] = L("the agent is not ready; run chief kickoff {} when it is at its input box",
-                  "Agent 尚未就绪；回到输入框后运行 chief kickoff {}").format(t["id"])
+    t["note"] = L("the adoption notice will be sent automatically when the agent is ready at its input box; "
+                  "or run chief kickoff {}",
+                  "Agent 就绪并回到输入框后将自动发送收编通知；也可运行 chief kickoff {}").format(t["id"])
     save_task(t)
     if wait_ready(cfg, t["session_id"], False, timeout=0) == "ready":
         send_kickoff(cfg, t)
@@ -1632,6 +1634,13 @@ def send_kickoff(cfg, t):
     t["kickoff_at"] = now_utc().isoformat()
     prompt = adoption_prompt(t) if t.get("adopted") else kickoff_prompt(t)
     marker = ADOPTION_MARK if t.get("adopted") else "delegated task managed by AoE Chief"
+    if t.get("adopted"):
+        # Claim the initial delivery before I/O. A crash or uncertain send must
+        # require an explicit kickoff, rather than duplicating the notice on tick.
+        t["state"] = "needs-you"
+        t["note"] = L("the adoption notice delivery is unconfirmed; check the session, then run chief kickoff {}",
+                      "收编通知尚未确认送达；请检查会话，然后运行 chief kickoff {}").format(t["id"])
+        save_task(t)
     if deliver(cfg, t["session_id"], prompt, marker):
         t["state"] = "running"
         t.pop("note", None)
@@ -2435,7 +2444,21 @@ def act(cfg, it, t, dry=False):
     st, log = it["status"], it.get("log") or {}
     if user_present(cfg, t, log) or session_user_present(cfg, t):
         return None
-    if t.get("autonomy") == "observe" or t.get("state") not in ACTIVE or st in ("running", "missing", "deleted"):
+    if t.get("state") not in ACTIVE or st in ("running", "missing", "deleted"):
+        return None
+    if t.get("adopted") and not t.get("kickoff_at"):
+        # The initial contract notice is pending, including for observe/test-first
+        # tasks. Its own needs-you note must not prevent readiness polling.
+        if wait_ready(cfg, t["session_id"], False, timeout=0) != "ready" or session_user_present(cfg, t):
+            return None
+        if dry:
+            return L("would send the pending adoption notice", "会发送待送达的收编通知")
+        send_kickoff(cfg, t)
+        message = (L("sent the pending adoption notice", "已发送待送达的收编通知") if t["state"] == "running" else
+                   L("adoption notice delivery unconfirmed; check the session", "收编通知尚未确认送达；请检查会话"))
+        log_event(t, "adopt", message)
+        return message
+    if t.get("autonomy") == "observe":
         return None
     if in_test_phase(t):
         return None                       # only a human accepting the tests may start implementation or review
