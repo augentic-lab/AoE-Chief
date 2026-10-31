@@ -158,6 +158,7 @@ See the [full safety model](docs/guide.md#safety-model) and [agent permissions](
 - [Supported agents](docs/agents.md): trust prompts, update and approval menus, and transcripts.
 - [Development](docs/development.md): tests and roadmap.
 - [Architecture](docs/architecture.md): task supervision, design rationale and implementation notes.
+- [Research tasks (design)](docs/design.md): research as a delegated task with a quote-checked memo (pilot).
 
 ## 🙏 Built on
 
