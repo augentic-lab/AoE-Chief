@@ -65,8 +65,7 @@ class EntryAndParsingTests(support.CommandFixture):
         goal = "Keep 雪, spaces, 'quotes', ; | > $HOME $(touch NEVER) `id` * ~ literal"
         args = ["new", "--repo", str(self.repo), "--name", "Quoted task", "--goal", goal,
                 "--check", "python3 -m unittest discover -s tests", "--protected", "tests",
-                "--rounds", "4", "--hours", "1.5", "--tool", "claude", "--model", "fixture-model",
-                "--effort", "high", "--branch", "chief/literal", "--base-branch",
+                "--rounds", "4", "--hours", "1.5", "--tool", "claude", "--branch", "chief/literal", "--base-branch",
                 self.git(self.repo, "branch", "--show-current"), "--autonomy", "observe",
                 "--no-test-first", "--id", "literal-task", "--draft"]
         self.scenario(*self.command("chief " + " ".join(map(shlex.quote, args))),
@@ -76,8 +75,7 @@ class EntryAndParsingTests(support.CommandFixture):
         self.assertEqual(task["checks"], ["python3 -m unittest discover -s tests"])
         self.assertEqual(task["protected"], ["tests"])
         self.assertEqual(task["budget"], {"rounds": 4, "hours": 1.5})
-        for name, value in (("tool", "claude"), ("model", "fixture-model"), ("effort", "high"),
-                            ("branch", "chief/literal"), ("autonomy", "observe"), ("phase", "build")):
+        for name, value in (("tool", "claude"), ("branch", "chief/literal"), ("autonomy", "observe"), ("phase", "build")):
             self.assertEqual(task[name], value)
         self.assertFalse((self.repo / "NEVER").exists())
         self.assertFalse(any(args[0] == "add" for args in self.aoe_args()))

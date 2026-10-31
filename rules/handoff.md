@@ -54,7 +54,8 @@ Write a JSON file outside the repository (for example with `mktemp --suffix .jso
 - **test_first**: keep `true` unless the user says otherwise. The worker first writes failing acceptance tests and the
   user approves them before implementation starts.
 - **tool**: `codex` (default), `claude` or `antigravity`. Use the user's preference if they stated one.
-- Optional: `scope` (the only directory the worker may change), `milestones` (list of text), `model`.
+- Optional: `scope` (the only directory the worker may change), `milestones` (list of text). Do not set `model` or
+  `effort`: Chief refuses them, because the worker always runs the default model from its own config.
 
 ## 3. Create the task
 Run Chief's `new` command with the contract. Use the Chief command named in your instructions; otherwise try `chief`,

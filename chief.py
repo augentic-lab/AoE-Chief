@@ -1059,6 +1059,15 @@ def prepare_new_task(contract, tid=None, trust=False):
     for key in ("repo", "name", "goal"):
         if not t.get(key):
             raise RuntimeError(L("a new task needs --{}", "立项需要 --{}").format(key))
+    # AoE forwards --model/--effort only to structured (ACP) sessions, and workers run in the terminal view, so the
+    # worker would silently run its own default. Refuse instead of pretending.
+    for key in ("model", "effort"):
+        if t.get(key):
+            raise RuntimeError(L("--{} is not supported: AoE applies it only to structured sessions, so the worker would "
+                                 "run its default. Set the worker's default in its own config (Claude: ~/.claude/settings.json; "
+                                 "Codex: ~/.codex/config.toml)",
+                                 "不支持 --{}：AoE 只对结构化会话生效，worker 实际会用它自己的默认值。请在 worker 自己的配置里设默认"
+                                 "（Claude：~/.claude/settings.json；Codex：~/.codex/config.toml）").format(key))
     t["repo"] = call(["git", "-C", os.path.expanduser(t["repo"]), "rev-parse", "--show-toplevel"], timeout=8).strip()
     t.setdefault("test_first", True)
     t["phase"] = "test" if t["test_first"] else "build"
