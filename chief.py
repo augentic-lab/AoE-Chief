@@ -1003,6 +1003,9 @@ UPDATE_RE = re.compile(
 # The agent's input box is on screen. Claude's footer hint changes with the mode (auto mode shows no "? for
 # shortcuts"), so also accept its box itself: a rule line directly above the ❯ prompt line.
 INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯", re.M)
+# The agent is mid-turn. Codex keeps its input box on screen while it works, and AoE can briefly report waiting
+# (for example during an automatic approval review), so the working line must veto readiness.
+BUSY_RE = re.compile(r"\besc to interrupt\b")
 
 def load_task(tid):
     p = TASKS/tid/"task.json"
@@ -1481,7 +1484,8 @@ def tmux_target(sid):
 def at_prompt(status, sc):
     """The agent is sitting at its input box. AoE sometimes reports waiting instead of idle after a turn, so trust the screen."""
     tail = (sc or "")[-800:]
-    return status in ("idle", "waiting") and bool(INPUT_RE.search(tail)) and not ASK_PATTERNS.search(tail)
+    return (status in ("idle", "waiting") and bool(INPUT_RE.search(tail)) and not ASK_PATTERNS.search(tail)
+            and not BUSY_RE.search(tail))
 
 def answer_trust_menu(cfg, sid, target, sc, numbers=True):
     """Use a displayed numeric shortcut (if numbers) or confirm Yes from a fresh menu capture."""
