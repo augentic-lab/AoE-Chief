@@ -18,9 +18,54 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `review`, `review_engine`, `review_level` | `true`, the other engine (Codex for Antigravity), 2 | Cross review using Codex or Claude |
 | `aoe_colors` | `true` | Mirror each task's state onto its AoE color dot: red needs you, amber working, green to accept |
 | `commands` | `{}` | Launch a tool through your own command, e.g. `{"claude": "claude-proxy"}`. See below |
+| `screen_patterns` | built-in patterns | Override `input`, `busy`, `menu`, or `ask` screen regexes; omitted entries keep their defaults. See below |
 
 If another program called `aoe` comes earlier in your `PATH`, Chief prefers `~/.local/bin/aoe`. You can also set
 `AOE_BIN`.
+
+## Agent readiness and screen patterns
+
+Chief requires a closed native transcript turn (`done` or `error`, never `open`),
+AoE status `idle` or `waiting`, and two identical screen captures about two seconds
+apart before sending input. Trailing whitespace is ignored on each line. Sessions
+without a transcript, such as a new session before kickoff, use the remaining
+signals. If a known transcript disappears, Chief stays blocked. Even a zero-timeout
+observation takes two captures; recognized update and trust menus still return
+immediately without typing into them.
+
+Screen patterns provide additional checks. `screen_patterns` is an object of Python
+regular-expression strings, matched with multiline anchors against the last 20
+screen lines. Each supplied key replaces that pattern; other keys retain defaults:
+
+| Pattern | Meaning and built-in behavior |
+|---|---|
+| `input` | Requires a visible input cue: Codex's input hint, `? for shortcuts`, or Claude's ruled input box |
+| `busy` | Vetoes `esc to interrupt` |
+| `menu` | Vetoes adjacent numbered options with a `❯`, `›`, or `>` selection cursor on any option, regardless of wording |
+| `ask` | Vetoes existing approval/question cues such as `Run this command?` or `[Y/n]` |
+
+For example, add a new busy cue while keeping the existing one:
+
+```json
+{
+  "screen_patterns": {
+    "busy": "\\besc to interrupt\\b|^Quantum operation pending$"
+  }
+}
+```
+
+JSON backslashes must be doubled. Invalid patterns or unknown keys block readiness
+and report a configuration error. Overrides cannot bypass transcript state, AoE
+status, screen quiescence, or the specific trust/update handling. Readiness blockers
+are recorded as `readiness` events in the task's `events.jsonl`; untracked sessions
+report them on stderr. Reasons distinguish transcript, status, changing screen,
+menu, and pattern vetoes.
+
+When a transcript is available, delivery is confirmed only by a new user prompt
+containing the message marker. A marker already in history, an assistant echo, or
+a running status cannot confirm it. Without a transcript, Chief retains screen/status
+confirmation for startup. Unconfirmed delivery requires user attention and is not
+automatically retried.
 
 ## Launching an agent through a wrapper
 

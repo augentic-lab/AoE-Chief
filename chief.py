@@ -230,7 +230,7 @@ def clip(s, n):
 
 def aoe_records(cfg):
     """AoE's internal session records (agent_session_id, view, ...). Read-only; empty if the format changes."""
-    p = AOE_HOME/"profiles"/cfg["profile"]/"sessions.json"
+    p = AOE_HOME/"profiles"/cfg.get("profile", "main")/"sessions.json"
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         rows = data if isinstance(data, list) else data.get("sessions", [])
@@ -558,10 +558,33 @@ def parse_footer(reply):
             found[k] = ""
     return found
 
-# An approval prompt starts its line; the same words inside a reply ("Decision needed: Approve the tests?") are prose.
-ASK_PATTERNS = re.compile(r"^[ \t│|›❯>•*-]*(?:Do you want to|Would you like to|(?:Allow|[Aa]pprove)\b|Press enter|Yes, and|允许|是否继续)"
-                          r"|^[ \t│┃|›❯>]*(?:Accept this file edit\?|Run this command\?)[ \t│┃|]*$"
-                          r"|\(y/n\)|\[Y/n\]", re.M)
+# Screen wording is supplementary evidence, configurable without a CLI-specific code change.
+# All patterns use MULTILINE. Specific trust/update detectors below retain their special handling.
+SCREEN_PATTERNS = {
+    "input": r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯",
+    "busy": r"\besc to interrupt\b",
+    # At least two adjacent numbered options, with a cursor on any option.
+    "menu": (r"(?=^(?:[ \t│┃]*[1-9][0-9]*[.)][ \t]+[^\r\n]*\r?\n)*"
+             r"[ \t│┃]*[❯›>][ \t]*[1-9][0-9]*[.)][ \t]+)"
+             r"^[ \t│┃]*[❯›>]?[ \t]*[1-9][0-9]*[.)][ \t]+[^\r\n]*"
+             r"(?:\r?\n[ \t│┃]*[❯›>]?[ \t]*[1-9][0-9]*[.)][ \t]+[^\r\n]*)+"),
+    # Approval questions start their line; the same words inside a reply are prose.
+    "ask": (r"^[ \t│|›❯>•*-]*(?:Do you want to|Would you like to|(?:Allow|[Aa]pprove)\b|Press enter|Yes, and|允许|是否继续)"
+            r"|^[ \t│┃|›❯>]*(?:Accept this file edit\?|Run this command\?)[ \t│┃|]*$"
+            r"|\(y/n\)|\[Y/n\]"),
+}
+ASK_PATTERNS = re.compile(SCREEN_PATTERNS["ask"], re.M)
+
+def screen_patterns(cfg):
+    overrides = cfg.get("screen_patterns", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("screen_patterns must be an object")
+    patterns = dict(SCREEN_PATTERNS)
+    for key, value in overrides.items():
+        if key not in patterns or not isinstance(value, str):
+            raise ValueError("invalid screen_patterns entry: " + str(key))
+        patterns[key] = value
+    return {key: re.compile(value, re.M) for key, value in patterns.items()}
 
 # ---------- Screen / git / artifacts ----------
 
@@ -1000,12 +1023,9 @@ UPDATE_RE = re.compile(
     r"(?=\n(?:[^\r\n]*\r?\n){0,3}?"
     r"^[ \t│┃]*[›❯]?[ \t]*(?:1[.)][ \t]+)?Update now"
     r"(?:[ \t]+\(runs[ \t]+`[^`\r\n]+`\))?[ \t│┃]*\r?$)", re.M)
-# The agent's input box is on screen. Claude's footer hint changes with the mode (auto mode shows no "? for
-# shortcuts"), so also accept its box itself: a rule line directly above the ❯ prompt line.
-INPUT_RE = re.compile(r"Ask Codex to do anything|\? for shortcuts|^─{20,}[ \t]*\n[ \t]*❯", re.M)
-# The agent is mid-turn. Codex keeps its input box on screen while it works, and AoE can briefly report waiting
-# (for example during an automatic approval review), so the working line must veto readiness.
-BUSY_RE = re.compile(r"\besc to interrupt\b")
+# Compatibility aliases; defaults and per-call overrides come from the single table above.
+INPUT_RE = re.compile(SCREEN_PATTERNS["input"], re.M)
+BUSY_RE = re.compile(SCREEN_PATTERNS["busy"], re.M)
 
 def load_task(tid):
     p = TASKS/tid/"task.json"
@@ -1490,11 +1510,39 @@ def tmux_target(sid):
         return None
     return next((n for n in names if n.endswith("_"+sid[:8]) and not n.startswith("aoe_term_")), None)
 
-def at_prompt(status, sc):
-    """The agent is sitting at its input box. AoE sometimes reports waiting instead of idle after a turn, so trust the screen."""
-    tail = (sc or "")[-800:]
-    return (status in ("idle", "waiting") and bool(INPUT_RE.search(tail)) and not ASK_PATTERNS.search(tail)
-            and not BUSY_RE.search(tail))
+def prompt_blocker(status, sc, patterns):
+    """Screen/status veto only: passing this is not permission to send; use wait_ready."""
+    if status not in ("idle", "waiting"):
+        return "status: " + str(status)
+    tail = "\n".join((sc or "").splitlines()[-20:])
+    if patterns["menu"].search(tail):
+        return "menu"
+    if patterns["busy"].search(tail):
+        return "pattern veto: busy"
+    if patterns["ask"].search(tail):
+        return "pattern veto: approval question"
+    if not tail.strip() or not patterns["input"].search(tail):
+        return "pattern veto: input not visible"
+    return None
+
+def at_prompt(status, sc, cfg=None):
+    """Compatibility screen check for display/judging; wait_ready also checks transcript and quiescence."""
+    try:
+        return prompt_blocker(status, sc, screen_patterns(cfg or {})) is None
+    except (ValueError, re.error):
+        return False
+
+def readiness_blocked(sid, reason):
+    """Keep the blocking signal in task history, or stderr for an untracked session."""
+    message = "readiness blocked for {}: {}".format(sid, reason)
+    task = board_by_session().get(sid)
+    if task:
+        try:
+            log_event(task, "readiness", message)
+            return
+        except OSError:
+            pass
+    print(message, file=sys.stderr)
 
 def answer_trust_menu(cfg, sid, target, sc, numbers=True):
     """Use a displayed numeric shortcut (if numbers) or confirm Yes from a fresh menu capture."""
@@ -1525,20 +1573,21 @@ def answer_trust_menu(cfg, sid, target, sc, numbers=True):
     return False
 
 def wait_ready(cfg, sid, trust, timeout=120):
-    """Wait until the agent can take input. Trust prompts are answered at most once and only when trust is True.
-    AoE may report idle before the TUI is drawn, so also require the input box on screen and no trust prompt.
-    Return update without any interaction when Codex offers its startup update menu.
-    A zero timeout is a single observation: never wait, start a worker or answer a trust prompt."""
-    if timeout <= 0:
-        st = json.loads(aoe(cfg, "session", "show", "--json", sid)).get("status")
-        sc = screen(cfg, sid) or ""
-        if UPDATE_RE.search(sc):
-            return "update"
-        if TRUST_RE.search(sc):
-            return "trust"
-        return "ready" if at_prompt(st, sc) else "timeout"
-    end = time.time() + timeout
-    while time.time() < end:
+    """Require closed native turn, AoE idle/waiting, and two quiet screen observations.
+
+    timeout<=0 samples once over two seconds without answering prompts. Update and
+    trust menus retain their early returns; enabled trust is answered at most once.
+    A lost transcript cannot turn a previously known session into a fresh startup.
+    """
+    single = timeout <= 0
+    end = time.time() + max(2, timeout)
+    previous, previous_blocker, previous_at, reported = None, None, None, None
+    known_transcript = False
+    try:
+        patterns, pattern_error = screen_patterns(cfg), None
+    except (ValueError, re.error) as exc:
+        patterns, pattern_error = None, "pattern veto: invalid screen_patterns: " + str(exc)
+    while True:
         try:
             st = json.loads(aoe(cfg, "session", "show", "--json", sid)).get("status")
         except (RuntimeError, ValueError):
@@ -1547,11 +1596,8 @@ def wait_ready(cfg, sid, trust, timeout=120):
         if UPDATE_RE.search(sc):
             return "update"
         trust_prompt = TRUST_RE.search(sc)
-        if at_prompt(st, sc) and not trust_prompt:
-            time.sleep(2)                       # a freshly drawn input box may not own the keyboard yet
-            return "ready"
         if trust_prompt:
-            if not trust:
+            if single or not trust:
                 return "trust"
             target = tmux_target(sid)
             if target:
@@ -1564,8 +1610,33 @@ def wait_ready(cfg, sid, trust, timeout=120):
                 else:
                     call(["tmux", "send-keys", "-t", target, "Enter"], timeout=5)
                 trust = False                   # answer it only once
-        time.sleep(3)
-    return "timeout"
+            previous, previous_blocker = None, None  # keys invalidate the earlier observation
+            if time.time() >= end:
+                return "timeout"
+            time.sleep(min(3, max(0, end - time.time())))
+            continue
+
+        log = transcript(aoe_records(cfg).get(sid, {}))
+        known_transcript = known_transcript or log is not None
+        if log is not None and log.get("turn") not in ("done", "error"):
+            blocker = "transcript open"
+        elif known_transcript and log is None:
+            blocker = "transcript unavailable"
+        else:
+            blocker = pattern_error or prompt_blocker(st, sc, patterns)
+        normalized = "\n".join(line.rstrip() for line in sc.splitlines()).rstrip()
+        reason = blocker or previous_blocker
+        if previous is not None and normalized != previous:
+            reason = reason or "screen changing"
+        if previous is not None and not reason and time.time() - previous_at >= 2:
+            return "ready"
+        if reason and reason != reported:
+            readiness_blocked(sid, reason)
+            reported = reason
+        if previous is not None and (single or time.time() >= end):
+            return "timeout"
+        previous, previous_blocker, previous_at = normalized, blocker, time.time()
+        time.sleep(2 if single else min(2, max(0, end - time.time())))
 
 def codex_update_note(cfg, t, action="kickoff"):
     """Re-observe for versions; the menu may have disappeared since wait_ready returned update."""
@@ -1629,11 +1700,37 @@ def start_task(cfg, t, trust=False):
     return t
 
 def deliver(cfg, sid, text, marker):
-    """Send a message and confirm the agent picked it up (status turns running, or the marker shows on screen)."""
+    """Send once; an existing transcript must record a new user prompt with the marker."""
+    rec = aoe_records(cfg).get(sid, {})
+    before = transcript(rec)
+    known_transcript = before is not None
+
+    def new_prompt(log):
+        if before is None:
+            return True
+        # turns_total counts the parsed tail, not necessarily the whole file:
+        # assistant output can change it without a new user message. Preserve
+        # fractional seconds here (parse_ts intentionally discards them).
+        if log.get("prompt_ts") and before.get("prompt_ts"):
+            try:
+                return (datetime.fromisoformat(log["prompt_ts"].replace("Z", "+00:00")) >
+                        datetime.fromisoformat(before["prompt_ts"].replace("Z", "+00:00")))
+            except (TypeError, ValueError):
+                return False
+        return (log.get("source") == before.get("source") and
+                log.get("last_prompt") != before.get("last_prompt"))
+
     aoe(cfg, "send", sid, text)
     end = time.time() + 45
     while time.time() < end:
         time.sleep(3)
+        rec = aoe_records(cfg).get(sid, rec)
+        log = transcript(rec)
+        known_transcript = known_transcript or log is not None
+        if known_transcript:
+            if log and marker in log.get("last_prompt", "") and new_prompt(log):
+                return True
+            continue
         try:
             st = json.loads(aoe(cfg, "session", "show", "--json", sid)).get("status")
         except (RuntimeError, ValueError):
