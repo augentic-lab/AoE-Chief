@@ -112,20 +112,25 @@ class CodexUpdateDetectionTests(unittest.TestCase):
             result = chief.wait_ready({"profile": "acceptance"}, SID, trust, timeout=timeout)
         self.assertEqual(result, expected)
         self.assertIsInstance(result, str, "retain wait_ready's string result interface")
-        self.assertEqual(io.capture.call_count, 1, "return on the first observed update menu")
-        io.aoe.assert_called_once_with({"profile": "acceptance"}, "session", "show", "--json", SID)
+        if expected in ("update", "trust"):
+            self.assertEqual(io.capture.call_count, 1, "special menus still return immediately")
+            io.aoe.assert_called_once_with({"profile": "acceptance"}, "session", "show", "--json", SID)
+            io.sleep.assert_not_called()
+        else:
+            self.assertGreaterEqual(io.capture.call_count, 2, "ordinary readiness needs a quiescence sample")
+            if timeout <= 0:
+                elapsed = sum(call[0][0] for call in io.sleep.call_args_list)
+                self.assertGreaterEqual(elapsed, 1.5)
+                self.assertLessEqual(elapsed, 3)
         io.call.assert_not_called()
         assert_no_intervention(io)
-        if expected == "update" or timeout <= 0:
-            io.sleep.assert_not_called()
         return result
 
     def reject(self, text):
-        # Both branches must reject mentions even when an input box is visible.
-        for timeout in (0, 12):
-            for trust in (False, True):
-                with self.subTest(timeout=timeout, trust=trust):
-                    self.observe(text + "\n" + READY, trust=trust, timeout=timeout, expected="ready")
+        # These cases reject the *specific update detector*. A surviving numbered
+        # cursor menu must now veto readiness generically, even if its heading is
+        # quoted or unrecognized. Do not equate "not update" with "ready".
+        self.assertIsNone(chief.UPDATE_RE.search(text + "\n" + READY))
 
     def test_exact_real_screen_in_both_timeout_modes_with_either_trust_setting(self):
         for timeout in (0, -1, 12):
@@ -231,11 +236,12 @@ class CodexUpdateDetectionTests(unittest.TestCase):
                 result = chief.wait_ready({"profile": "acceptance"}, SID, trust, timeout=12)
                 self.assertEqual(result, "update")
                 self.assertEqual(io.capture.call_count, 2)
-                io.sleep.assert_called_once_with(3)
+                self.assertGreaterEqual(sum(call[0][0] for call in io.sleep.call_args_list), 1.5)
+                self.assertLessEqual(sum(call[0][0] for call in io.sleep.call_args_list), 3)
                 io.call.assert_not_called()
                 assert_no_intervention(io)
 
-    def test_zero_timeout_still_never_waits_starts_workers_or_answers_other_prompts(self):
+    def test_zero_timeout_only_observes_and_never_starts_workers_or_answers_prompts(self):
         for timeout in (0, -1):
             for trust in (False, True):
                 for text, status, expected in ((READY, "idle", "ready"),
