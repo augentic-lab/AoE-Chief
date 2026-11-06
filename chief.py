@@ -1073,9 +1073,23 @@ def new_task_id(name):
         tid, n = "{}-{}".format(base, n), n+1
     return tid
 
+def task_command(t):
+    """Validate a task's optional bare launcher name without probing git or sessions."""
+    if "command" not in t:
+        return None
+    command = t["command"]
+    if not isinstance(command, str) or not command or re.search(r"[\s/\\\x00]", command):
+        raise RuntimeError(L(
+            "--command must be a non-empty bare name on PATH, without whitespace or path separators; "
+            "otherwise AoE loses session-id tracking and Chief cannot read the transcript",
+            "--command 必须是 PATH 上非空的裸命令名，不能包含空白或路径分隔符；"
+            "否则 AoE 会丢失会话 ID 跟踪，Chief 无法读取对话记录"))
+    return command
+
 def prepare_new_task(contract, tid=None, trust=False):
     """Apply `new` defaults and check identity without saving or creating git/session artifacts."""
     t = dict(contract)
+    task_command(t)
     for key in ("repo", "name", "goal"):
         if not t.get(key):
             raise RuntimeError(L("a new task needs --{}", "立项需要 --{}").format(key))
@@ -1112,6 +1126,9 @@ ADOPTION_GOAL = "Carry out the plan agreed earlier in this conversation."
 
 def prepare_adoption(cfg, session=None, contract=None, tid=None):
     """Resolve and validate an in-place contract without writing state or touching the worker."""
+    if "command" in (contract or {}):
+        raise RuntimeError(L("adopt does not support --command: adoption does not launch a worker",
+                             "adopt 不支持 --command：收编不会启动新的 worker"))
     if session is None:
         if not os.environ.get("TMUX"):
             raise RuntimeError(L("specify a session ID, or run chief adopt inside its AoE tmux session",
@@ -1655,13 +1672,14 @@ def agent_command(cfg, tool):
     """The command to launch for a tool, from config "commands" (e.g. {"claude": "claude-proxy"}); None keeps the default."""
     return ((cfg.get("commands") or {}).get(tool) or "").strip() or None
 
-def with_agent_command(cfg, cmd, tool):
-    """Append AoE's --cmd-override when the tool has a configured command."""
-    c = agent_command(cfg, tool)
+def with_agent_command(cfg, cmd, tool, command=None):
+    """Append AoE's --cmd-override, preferring the task's validated command."""
+    c = command or agent_command(cfg, tool)
     return cmd + ["--cmd-override", c] if c else cmd
 
 def add_command(cfg, t, dry_run=False):
     """Prepare the local task branch so AoE reuses it instead of choosing a remote base."""
+    command = task_command(t)
     if not dry_run:
         git = ["git", "-C", t["repo"]]
         if not call(git + ["branch", "--list", "--", t["branch"]], timeout=8).strip():
@@ -1671,7 +1689,7 @@ def add_command(cfg, t, dry_run=False):
     for k in ("model", "effort"):
         if t.get(k):
             cmd += ["--" + k, t[k]]
-    return with_agent_command(cfg, cmd, t["tool"])
+    return with_agent_command(cfg, cmd, t["tool"], command)
 
 def start_task(cfg, t, trust=False):
     out = call(add_command(cfg, t), timeout=120)
@@ -2682,7 +2700,7 @@ def rotate_task(cfg, t, it, reason):
     for k in ("model", "effort"):
         if t.get(k):
             cmd += ["--" + k, t[k]]
-    out = call(with_agent_command(cfg, cmd, t["tool"]), timeout=120)
+    out = call(with_agent_command(cfg, cmd, t["tool"], task_command(t)), timeout=120)
     sid = re.search(r"^\s*ID:\s*([0-9a-f]{16})", out, re.M)
     if not sid:
         raise RuntimeError(L("rotation failed: no session ID in the aoe add output:\n", "换会话失败，没能解析出新会话 ID：\n") + out[-600:])
@@ -3233,7 +3251,7 @@ def pick_model(cfg, engine, level, model=None, effort=None):
     spec = dict(DEFAULT_MODELS[engine][str(level)])
     spec.update(cfg.get("models", {}).get(engine, {}).get(str(level), {}))
     if agent_command(cfg, engine):
-        spec["command"] = agent_command(cfg, engine)       # Chief's own AI calls use the same launcher
+        spec["command"] = agent_command(cfg, engine)       # Chief's own AI calls always use the config launcher
     if model:
         spec["model"] = model
     if effort:
@@ -3282,6 +3300,8 @@ def show(cfg, sid, n):
     if task:
         out.append(L("Goal: {}\nDone when: {}\nArtifact: {}", "目标：{}\n验收：{}\n交付物：{}").format(
             task.get("goal", "-"), task.get("done_when", "-"), task.get("artifact", "-")))
+        if task.get("command"):
+            out.append(L("Worker command: {}", "Worker 启动命令：{}").format(task["command"]))
     ck = load_json(CHECKS, {}).get(sid)
     if ck and "results" in ck:
         out.append(L("Checks ({}, {}/{} pass):", "检查（{}，{}/{} 通过）：").format(ago(ck["at"]), ck["passed"], ck["total"]))
@@ -3686,6 +3706,9 @@ def argument_parser(parser_class=argparse.ArgumentParser, selected=None):
     nw.add_argument("--tool", choices=["codex", "claude", "antigravity"], help=L(
         "worker tool (antigravity launches agy; AI engines remain codex/claude)",
         "工作工具（antigravity 启动 agy；AI 引擎仍为 codex/claude）"))
+    nw.add_argument("--command", dest="worker_command", metavar="NAME", help=L(
+        "worker launch command: a bare name on PATH; overrides config commands for this task only",
+        "worker 启动命令：PATH 上的裸命令名；仅为此任务覆盖配置中的 commands"))
     nw.add_argument("--model")
     nw.add_argument("--effort")
     nw.add_argument("--branch", help=L("default: chief/<task id>", "默认 chief/<任务 id>"))
@@ -3930,6 +3953,9 @@ def main(argv=None):
                       "tool", "model", "effort", "branch", "base_branch", "autonomy", "test_first"):
                 if getattr(args, k) is not None:
                     t[k] = getattr(args, k)
+            if args.worker_command is not None:
+                t["command"] = args.worker_command
+            task_command(t)
             t.setdefault("repo", os.getcwd())
             if args.intent is not None:
                 if not args.intent.strip():

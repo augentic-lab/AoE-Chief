@@ -71,11 +71,16 @@ automatically retried.
 
 **Launching an agent through a wrapper.** Use `commands` when an agent must start through your own script rather
 than its plain binary: an API proxy or model router, a pinned version, extra environment variables, a sandbox. The
-command is used everywhere Chief starts that tool:
+command is used by default everywhere Chief starts that tool:
 
 - `chief new` and session rotation pass it to `aoe add --cmd-override`. AoE stores it with the session, so restarts
   and resumes go through it too;
 - Chief's own AI calls with that engine (Codex/Claude briefs, decision drafts, cross reviews).
+
+A delegated task can set `"command": "claude-mix"` (or `chief new --command claude-mix`) to override
+`commands[tool]` for its worker, including session rotation. Use a non-empty bare name on the tmux `PATH`,
+without whitespace or path separators: arguments or paths lose AoE's session-id tracking. Chief's own AI calls
+keep using config `commands`. `chief adopt` refuses `--command` because it does not launch a worker.
 
 A wrapper must:
 
@@ -103,9 +108,9 @@ is safe:
 - each session keeps the command it was started with, including across restarts and resumes;
 - Chief can track a session opened directly in AoE, because it reads the transcript, which does not depend on how
   the agent was launched;
-- if Chief rotates a delegated session, the successor starts through Chief's command. Adopted sessions never rotate. Work carries over through the
-  progress file as usual; only the endpoint changes (with a model router, for example, routed models become
-  available).
+- if Chief rotates a delegated session, the successor uses the task's `command`, falling back to config
+  `commands[tool]`. Adopted sessions never rotate. Work carries over through the progress file as usual;
+  only the endpoint changes (with a model router, for example, routed models become available).
 
 To route sessions opened directly in AoE as well, configure the command in AoE itself (its
 `session.agent_command_override` setting; see AoE's documentation). Chief's `commands` can then stay or be removed.

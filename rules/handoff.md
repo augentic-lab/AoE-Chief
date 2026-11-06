@@ -87,8 +87,10 @@ Write a JSON file outside the repository (for example with `mktemp --suffix .jso
 - **test_first**: keep `true` unless the user says otherwise. The worker first writes failing acceptance tests and the
   user approves them before implementation starts.
 - **tool**: `codex` (default), `claude` or `antigravity`. Use the user's preference if they stated one.
-- Optional: `scope` (the only directory the worker may change), `milestones` (list of text). Do not set `model` or
-  `effort`: Chief refuses them, because the worker always runs the default model from its own config.
+- Optional: `scope` (the only directory the worker may change), `milestones` (list of text),
+  `"command": "claude-mix"` for a GLM worker. `command` overrides config `commands[tool]` for this worker and
+  rotation only; use a bare name on PATH, with no whitespace or path separators. `adopt` refuses it.
+  Do not set `model` or `effort`: Chief still refuses them; the selected launcher supplies the worker's defaults.
 
 ## 3. Create the task
 Run Chief's `new` command with the contract. Use the Chief command named in your instructions; otherwise try `chief`,
