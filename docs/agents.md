@@ -40,11 +40,11 @@ Folder-trust prompts require task trust to be enabled, as described above.
 
 ## Codex
 
-**Codex startup update menu:** `Update available · <old> → <new>` followed by `Update now` needs your action.
-Chief never updates or skips this menu, even with `--trust`; it sends no keys or kickoff/resume text.
-`Update now` runs bare `npm install -g @openai/codex`, which may use the wrong global prefix.
-Upgrade Codex yourself using your intended installation method and prefix, or press `Esc` in the session to skip
-the menu. Then run `chief.py kickoff <id>` (or `chief.py nudge <id>` after session rotation).
+**Codex startup update menu:** `Update available · <old> → <new>` followed by `Update now` pauses kickoff.
+Chief sends no menu keys, even with `--trust`. Accept the `codex-update` decision to run Chief's configured
+update command (default: `npm install -g @openai/codex@{version} --prefix ~/.npm-global`), verify the binary,
+and resume automatically. Codex's own `Update now` uses the wrong global prefix and is never selected.
+A manual update or pressing `Esc` in the session also resumes automatically on tick.
 The boxed `✨ Update available! <old> -> <new>` history banner left after Esc is informational; with the normal
 input box, Codex is ready. A still-open update menu below that banner continues to block Chief.
 

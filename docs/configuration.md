@@ -18,6 +18,8 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `review`, `review_engine`, `review_level` | `true`, the other engine (Codex for Antigravity), 2 | Cross review using Codex or Claude |
 | `aoe_colors` | `true` | Mirror each task's state onto its AoE color dot: red needs you, amber working, green to accept |
 | `commands` | `{}` | Launch a tool through your own command, e.g. `{"claude": "claude-proxy"}`. See below |
+| `codex_update_command` | `["npm", "install", "-g", "@openai/codex@{version}", "--prefix", "~/.npm-global"]` | Update argv; `{version}` is the menu target, or `latest` when unknown. `~` expands. Runs only after accepting an update card, without a shell, with a 300-second timeout; no fallback installer |
+| `notify_command` | absent | Optional argv, e.g. `["notify-send", "{message}"]`. Receives the update-card message once when created; runs without a shell with a 15-second timeout. No worker transcript is passed |
 | `screen_patterns` | built-in patterns | Override `input`, `busy`, `menu`, or `ask` screen regexes; omitted entries keep their defaults. See below |
 
 If another program called `aoe` comes earlier in your `PATH`, Chief prefers `~/.local/bin/aoe`. You can also set

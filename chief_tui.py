@@ -234,6 +234,7 @@ def keys_for(ch, e):
     k = []
     if e and e["decision"] and (e["draft"] or e.get("test_approval") or e.get("protected_approval")):
         k.append(L("a approve tests", "a 批准测试") if e.get("test_approval") else
+                 L("a update Codex", "a 更新 Codex") if e["decision"].get("kind") == "codex-update" else
                  L("a approve paths", "a 批准路径") if e.get("protected_approval") else L("a accept", "a 采纳"))
     if e and e["status"] != "missing":
         k.append(L("r reply", "r 回复"))       # a pending decision, a board task or any tracked session
@@ -1269,16 +1270,21 @@ class Inbox:
         ch, L = self.ch, self.ch.L
         approval = e.get("test_approval")
         protected = e.get("protected_approval")
+        codex_update = e["decision"].get("kind") == "codex-update"
 
         def accept():
             decision = self.decision(e, approval=True)
             ok = ch.accept_decision(self.cfg, decision)
+            if decision.get("kind") == "codex-update":
+                return (L("Codex update complete; waiting workers resumed", "Codex 更新完成；等待中的 Worker 已继续") if ok else
+                        L("Codex update/resume needs attention; see the task note", "Codex 更新/继续需要处理；请查看任务说明"))
             if protected:
                 return ch.protected_approval_message(decision)
             return self.sent(ok, L("approved the acceptance tests", "已批准验收测试") if approval else
                              L("sent chief's draft", "已发送 chief 的草稿"))
 
         self.job(L("approving the acceptance tests", "批准验收测试") if approval else
+                 L("updating Codex", "更新 Codex") if codex_update else
                  L("approving protected paths", "批准受保护路径") if protected else L("sending the draft", "发送草稿"),
                  accept)
 

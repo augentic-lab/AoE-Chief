@@ -220,6 +220,13 @@ still apply. Explicitly protected acceptance tests and support files require exa
 allowances never unlock them. This approval flow is disabled during the test phase, whose test exemptions,
 support-file review and explicit approval transition to build remain unchanged.
 
+When Codex shows its startup update menu, Chief saves the interrupted kickoff and waits with a
+`codex-update` decision. Press **a** in the console or use `chief decide <id>:<n> --accept` to run
+the configured update command once for workers waiting for the same version. Chief checks the
+worker binary with `--version`, stops and starts each session, and resumes its kickoff automatically.
+Failures stay needs-you without retrying in a loop. Updating by hand or pressing Esc in the worker
+also resumes on the next tick; Chief never selects Codex's `Update now` option.
+
 ## Closing and cleaning tasks
 
 These archive and cleanup operations apply to delegated tasks. For adopted tasks, close means release, as above.

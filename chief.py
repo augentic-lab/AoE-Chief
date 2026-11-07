@@ -7,6 +7,7 @@ detection, session rotation and cross-model review. Python 3.7+, standard librar
 """
 import argparse
 import builtins
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import fnmatch
 from functools import lru_cache
@@ -1655,18 +1656,299 @@ def wait_ready(cfg, sid, trust, timeout=120):
         previous, previous_blocker, previous_at = normalized, blocker, time.time()
         time.sleep(2 if single else min(2, max(0, end - time.time())))
 
-def codex_update_note(cfg, t, action="kickoff"):
-    """Re-observe for versions; the menu may have disappeared since wait_ready returned update."""
+CODEX_UPDATE_COMMAND = ["npm", "install", "-g", "@openai/codex@{version}", "--prefix", "~/.npm-global"]
+SEMVER_RE = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?")
+
+
+def semver_key(version):
+    m = SEMVER_RE.fullmatch(version or "")
+    if not m:
+        raise RuntimeError("cannot parse Codex semver: " + str(version))
+    pre = m.group(4)
+    parts = pre.split(".") if pre else []
+    if any(p.isdigit() and len(p) > 1 and p.startswith("0") for p in parts):
+        raise RuntimeError("cannot parse Codex semver: " + version)
+    return tuple(int(m.group(n)) for n in (1, 2, 3)) + (
+        not bool(pre), tuple((0, int(p)) if p.isdigit() else (1, p) for p in parts))
+
+
+def codex_version(cfg, t):
+    command = task_command(t) or agent_command(cfg, "codex") or "codex"
+    binary = shutil.which(command)
+    if not binary:
+        raise RuntimeError("Codex command not found on PATH: " + command)
+    output = call([binary, "--version"], timeout=15).strip()
+    m = re.fullmatch(r"(?:codex(?:-cli)?\s+)?v?(" + SEMVER_RE.pattern + r")", output)
+    if not m:
+        raise RuntimeError("cannot parse Codex --version output: " + clip(output, 200))
+    version = m.group(1)
+    semver_key(version)
+    return version
+
+
+def config_argv(value, key, placeholder, replacement):
+    if not isinstance(value, list) or not value or any(
+            not isinstance(arg, str) or not arg or "\0" in arg for arg in value):
+        raise RuntimeError(key + " must be a nonempty argv list of nonempty strings")
+    return [os.path.expanduser(arg.replace(placeholder, replacement)) for arg in value]
+
+
+def codex_update_argv(cfg, version):
+    if version:
+        semver_key(version)
+    return config_argv(cfg.get("codex_update_command", CODEX_UPDATE_COMMAND),
+                       "codex_update_command", "{version}", version or "latest")
+
+
+def pending_codex_update(t):
+    pending = t.get("pending_resume") or {}
+    return pending if pending.get("kind") == "codex-update" else None
+
+
+def wait_for_codex_update(cfg, t, resume=False):
+    """Observe only: save the interrupted step and one durable Chief action card."""
+    with codex_update_lock(t["id"]):
+        stored = load_task(t["id"])
+        if (stored.get("session_id") == t.get("session_id") and t.get("pending_resume")
+                and not pending_codex_update(stored) and stored.get("state") == "running"):
+            t.update(stored)  # Another process already resumed this interrupted step.
+            t.pop("pending_resume", None)
+            t.pop("note", None)
+            return
+        if stored.get("session_id") == t.get("session_id") and pending_codex_update(stored):
+            t["pending_resume"] = stored["pending_resume"]
+        record_codex_update(cfg, t, resume)
+
+
+def record_codex_update(cfg, t, resume):
     menu = UPDATE_RE.search(screen(cfg, t["session_id"]) or "")
-    if menu:
-        message = L("Codex is offering an update from {} to {}. ",
-                    "Codex 正在提供从 {} 到 {} 的更新。").format(menu.group("old"), menu.group("new"))
-    else:
-        message = L("Codex is offering an update. ", "Codex 正在提供更新。")
-    return message + L(
-        "Chief never updates or skips it. Upgrade Codex yourself or skip the menu in the session with Esc, "
-        "then run chief.py {} {}",
-        "Chief 从不更新或跳过此菜单。请自行升级 Codex，或在会话中按 Esc 跳过菜单，然后运行 chief.py {} {}").format(action, t["id"])
+    pending = pending_codex_update(t)
+    if not pending:
+        pending = dict(kind="codex-update", step="rotation-kickoff" if resume else "kickoff",
+                       **{"from": menu.group("old") if menu else None,
+                          "to": menu.group("new") if menu else None, "since": now_utc().isoformat()})
+        pending["baseline"] = pending["from"]
+        if not pending["baseline"]:
+            try:
+                pending["baseline"] = codex_version(cfg, t)
+            except RuntimeError as exc:
+                log_event(t, "codex-update", str(exc))
+        t["pending_resume"] = pending
+    versions = ("{} → {}".format(pending["from"], pending["to"])
+                if pending["from"] and pending["to"] else L("version unknown", "版本未知"))
+    question = L("Codex wants an update ({}). Update and resume the waiting workers?",
+                 "Codex 请求更新（{}）。更新并继续等待中的 Worker？").format(versions)
+    ds = load_decisions(t["id"])
+    for d in ds:
+        if (d.get("kind") == "codex-update" and d["state"] == "pending"
+                and (d.get("session") != t["session_id"] or d.get("target") != pending["to"]
+                     or d.get("since") != pending["since"])):
+            d.update(state="superseded", resolved_at=now_utc().isoformat())
+    decision = next((d for d in ds if d.get("kind") == "codex-update" and d["state"] == "pending"), None)
+    created = decision is None
+    if created:
+        try:
+            command = " ".join(shlex.quote(a) for a in codex_update_argv(cfg, pending["to"]))
+            choice = L("Accepting runs {} and resumes workers waiting for this version.",
+                       "接受后运行 {}，并继续等待此版本的 Worker。").format(command)
+        except RuntimeError as exc:
+            choice = str(exc)
+        decision = dict(id="{}:{}".format(t["id"], len(ds) + 1), task=t["id"], session=t["session_id"],
+                        kind="codex-update", target=pending["to"], since=pending["since"], question=question,
+                        choice=choice, draft=choice, size="big", why=[], by="chief", context={},
+                        state="pending", created_at=now_utc().isoformat())
+        ds.append(decision)
+        save_decisions(t["id"], ds)
+    t["state"] = "needs-you"
+    t["note"] = question + L(
+        " Chief is waiting; press a in the console or run chief decide {} --accept. "
+        "Chief never selects Update now. A manual update or Esc in the worker also continues automatically on tick.",
+        " Chief 正在等待；在控制台按 a 或运行 chief decide {} --accept。"
+        "Chief 不会选择 Update now。手动更新或在 Worker 中按 Esc 后，tick 也会自动继续。").format(decision["id"])
+    save_task(t)
+    if created:
+        log_event(t, "codex-update", t["note"])
+        if cfg.get("notify_command") is not None:
+            try:
+                argv = config_argv(cfg["notify_command"], "notify_command", "{message}", question + " " + decision["choice"])
+                call(argv, timeout=15)
+            except RuntimeError as exc:
+                log_event(t, "codex-update", "notification failed: " + str(exc))
+
+
+@contextmanager
+def codex_update_lock(tid=None):
+    """Serialize card acceptance and tick recovery across Chief processes."""
+    path = TASKS/tid/"codex-update.lock" if tid else ROOT/"codex-update.lock"
+    with open(str(path), "w") as lock:
+        try:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            pass
+        except OSError as exc:
+            raise RuntimeError("a Codex update is already in progress; wait for it to finish") from exc
+        yield
+
+
+def codex_update_reached(pending, version):
+    if pending.get("to"):
+        return semver_key(version) >= semver_key(pending["to"])
+    return bool(pending.get("baseline") and version != pending["baseline"])
+
+
+def codex_update_failed(t, reason):
+    reason = redact(reason)
+    note = L("Codex update/resume failed: ", "Codex 更新/继续失败：") + reason
+    if t.get("note") != note:
+        log_event(t, "codex-update", note)
+    t.update(state="needs-you", note=note)
+    save_task(t)
+    for d in load_decisions(t["id"]):
+        if d.get("kind") == "codex-update" and d["state"] == "pending":
+            d["error"] = reason
+            update_decision(d)
+
+
+def resume_codex_update(cfg, t, restart, resolution):
+    pending = pending_codex_update(t)
+    if pending.get("delivery_attempted"):
+        codex_update_failed(t, "kickoff delivery unconfirmed; check the session before sending any manual follow-up")
+        return False
+    # Claim before I/O. A crash, unready restart, or uncertain send cannot replay on tick.
+    pending["auto_blocked"] = True
+    save_task(t)
+    try:
+        if restart:
+            aoe(cfg, "session", "stop", t["session_id"])
+            aoe(cfg, "session", "start", t["session_id"])
+        ready = wait_ready(cfg, t["session_id"], False, timeout=30 if restart else 0)
+        if ready != "ready":
+            codex_update_failed(t, "worker readiness: " + str(ready))
+            return False
+        pending["delivery_attempted"] = True
+        save_task(t)
+        if pending["step"] == "rotation-kickoff":
+            ok = deliver(cfg, t["session_id"], kickoff_prompt(t, resume=True), "delegated task managed by AoE Chief")
+            t["state"] = "running" if ok else "needs-you"
+            if not ok:
+                t["note"] = "the new session's kickoff delivery is unconfirmed; check the session"
+        else:
+            send_kickoff(cfg, t)
+            ok = t["state"] == "running"
+        if ok:
+            t.pop("pending_resume", None)
+            t.pop("note", None)
+        save_task(t)
+        for d in load_decisions(t["id"]):
+            if d.get("kind") == "codex-update" and d["state"] == "pending":
+                d.update(state="sent", resolution=resolution, delivered=ok, resolved_at=now_utc().isoformat())
+                d.pop("error", None)
+                update_decision(d)
+        log_event(t, "codex-update", "resumed " + pending["step"] if ok else "kickoff delivery unconfirmed")
+        return ok
+    except RuntimeError as exc:
+        codex_update_failed(t, str(exc))
+        return False
+
+
+def run_codex_update(argv, tasks):
+    def event(text):
+        for task in tasks:
+            log_event(task, "codex-update", redact(text))
+
+    event("running command: " + json.dumps(argv, ensure_ascii=False))
+    try:
+        result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, shell=False, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        def decoded(value):
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+        tail = decoded(getattr(exc, "output", "")) + "\n" + decoded(getattr(exc, "stderr", ""))
+        event("command exit code unavailable: {}; output tail: {}".format(exc, tail[-2000:]))
+        raise RuntimeError("Codex update command failed: " + str(exc)) from exc
+    event("command exit code {}; output tail: {}".format(
+        result.returncode, ((result.stdout or "") + "\n" + (result.stderr or ""))[-2000:]))
+    if result.returncode:
+        raise RuntimeError("Codex update command failed (exit {})".format(result.returncode))
+
+
+def accept_codex_update(cfg, decision):
+    with codex_update_lock():
+        d = find_decision(decision["id"])
+        t = load_task(d["task"])
+        pending = pending_codex_update(t)
+        if (d["state"] != "pending" or not pending or t.get("session_id") != d["session"]
+                or pending["since"] != d.get("since") or pending["to"] != d.get("target")):
+            raise RuntimeError("the Codex update request changed; refresh the decision")
+        if pending.get("delivery_attempted"):
+            raise RuntimeError("kickoff delivery unconfirmed; check the session before running chief kickoff manually")
+        tasks = [task for task in all_tasks() if task.get("state") in ACTIVE and pending_codex_update(task)
+                 and pending_codex_update(task)["to"] == pending["to"]
+                 and not pending_codex_update(task).get("delivery_attempted")]
+        try:
+            argv = codex_update_argv(cfg, pending["to"])
+            reached = []
+            for task in tasks:
+                try:
+                    version = codex_version(cfg, task)
+                    task_pending = pending_codex_update(task)
+                    if not task_pending.get("baseline"):
+                        task_pending["baseline"] = version
+                        save_task(task)
+                    reached.append(codex_update_reached(task_pending, version))
+                except RuntimeError:
+                    reached.append(False)
+            if any(not pending_codex_update(task).get("to") and not pending_codex_update(task).get("baseline")
+                   for task in tasks):
+                raise RuntimeError("cannot establish the previous Codex version; fix --version before updating to latest")
+            if not all(reached):
+                run_codex_update(argv, tasks)
+        except RuntimeError as exc:
+            for task in tasks:
+                codex_update_failed(task, str(exc))
+            return False
+        outcomes = []
+        for task in tasks:
+            try:
+                version = codex_version(cfg, task)
+                if not codex_update_reached(pending_codex_update(task), version):
+                    raise RuntimeError("Codex --version {} has not reached {}".format(version, pending["to"] or "a changed version"))
+                log_event(task, "codex-update", "verified Codex --version " + version)
+                pending_codex_update(task)["verified_version"] = version
+                outcomes.append(resume_codex_update(cfg, task, True, "accepted"))
+            except RuntimeError as exc:
+                codex_update_failed(task, str(exc))
+                outcomes.append(False)
+        return all(outcomes)
+
+
+def poll_codex_update(cfg, t):
+    pending = pending_codex_update(t)
+    if pending.get("delivery_attempted") or session_user_present(cfg, t):
+        return False
+    with codex_update_lock():
+        t = load_task(t["id"])
+        pending = pending_codex_update(t)
+        if not pending or pending.get("delivery_attempted"):
+            return False
+        try:
+            version = codex_version(cfg, t)
+            reached = codex_update_reached(pending, version)
+            if reached and (not pending.get("auto_blocked") or version != pending.get("verified_version")):
+                pending["verified_version"] = version
+                return resume_codex_update(cfg, t, True, "done-by-user")
+            unchanged = pending.get("baseline") and version == pending["baseline"]
+            if ((unchanged or (reached and pending.get("auto_blocked")))
+                    and not UPDATE_RE.search(screen(cfg, t["session_id"]) or "")
+                    and wait_ready(cfg, t["session_id"], False, timeout=0) == "ready"):
+                return resume_codex_update(cfg, t, False, "done-by-user")
+        except RuntimeError as exc:
+            codex_update_failed(t, str(exc))
+    return False
 
 def agent_command(cfg, tool):
     """The command to launch for a tool, from config "commands" (e.g. {"claude": "claude-proxy"}); None keeps the default."""
@@ -1706,7 +1988,7 @@ def start_task(cfg, t, trust=False):
     if ready != "ready":
         t["state"] = "needs-you"
         if ready == "update":
-            t["note"] = codex_update_note(cfg, t)
+            wait_for_codex_update(cfg, t)
         else:
             t["note"] = {"trust": L("the agent asks whether to trust this folder: confirm in the session, then run chief.py kickoff ",
                                     "Agent 在问是否信任这个目录：进入会话确认后运行 chief.py kickoff ") + t["id"],
@@ -1955,17 +2237,17 @@ def sync_decisions(cfg, task, it):
     ts, now = log.get("last_ts"), now_utc().isoformat()
     ds, dirty = load_decisions(task["id"]), False
     for d in ds:
-        if d["state"] == "pending" and not is_protected_approval(d) and d["turn_ts"] != ts:
+        if d["state"] == "pending" and d.get("kind") != "codex-update" and not is_protected_approval(d) and d["turn_ts"] != ts:
             d.update(state="superseded", resolved_at=now)    # most likely you answered inside the session
             dirty = True
     protected_dirty = sync_protected_decisions(task, it, ds, now)
     generated_questions = {d["question"] for d in ds if is_protected_approval(d)} if not in_test_phase(task) else set()
     for d in ds:
-        if d["state"] == "pending" and not is_protected_approval(d) and d["question"] in generated_questions:
+        if d["state"] == "pending" and d.get("kind") != "codex-update" and not is_protected_approval(d) and d["question"] in generated_questions:
             d.update(state="superseded", resolved_at=now)
             dirty = True
     ft = log.get("footer") if log.get("turn") == "done" else None
-    cur = next((d for d in ds if not is_protected_approval(d) and d["turn_ts"] == ts), None)
+    cur = next((d for d in ds if d.get("kind") != "codex-update" and not is_protected_approval(d) and d["turn_ts"] == ts), None)
     if ft and ft.get("decision") and not cur and ft["decision"] not in generated_questions:
         sigs = [s for s in it.get("signals", []) if s[2] not in ("decision", "blocker")]
         size, why, rec = classify(task, ft, sigs)
@@ -1988,7 +2270,8 @@ def sync_decisions(cfg, task, it):
         dirty = dirty or before != cur
     if dirty or protected_dirty:
         save_decisions(task["id"], ds)
-    generated = next((d for d in ds if d["state"] == "pending" and is_protected_approval(d)), None)
+    generated = next((d for d in ds if d["state"] == "pending" and d.get("kind") == "codex-update"), None)
+    generated = generated or next((d for d in ds if d["state"] == "pending" and is_protected_approval(d)), None)
     if generated:
         return generated
     return cur if cur and cur["state"] == "pending" else None
@@ -2021,6 +2304,8 @@ def note_preference(d, what):
 
 def send_decision(cfg, d, text, resolution):
     """Send only if the session is still at the turn that asked, and can take input."""
+    if d.get("kind") == "codex-update":
+        raise RuntimeError("Codex update decisions run in Chief; use --accept, or dismiss the menu with Esc in the worker")
     if is_protected_approval(d) and resolution == "accepted":
         return accept_protected(cfg, d)
     rec = aoe_records(cfg).get(d["session"])
@@ -2077,6 +2362,8 @@ def send_decision(cfg, d, text, resolution):
     return ok
 
 def accept_decision(cfg, d):
+    if d.get("kind") == "codex-update":
+        return accept_codex_update(cfg, d)
     if is_protected_approval(d):
         return send_decision(cfg, d, "", "accepted")
     if is_test_approval(load_task(d["task"]), d.get("question")):
@@ -2667,6 +2954,8 @@ def act(cfg, it, t, dry=False):
     if rotate:
         try:
             rotate_task(cfg, t, it, L("context at {}%", "上下文已用 {}%").format(used))
+            if pending_codex_update(t):
+                return L("waiting for a Codex update decision", "正在等待 Codex 更新决定")
             return L("continued in a fresh session (context {}%)", "换新会话继续（上下文 {}%）").format(used)
         except RuntimeError as e:                         # if rotation fails, continue in the old session
             log_event(t, "error", L("could not rotate; continuing in the current session: ", "换会话失败，改在原会话继续：")
@@ -2713,7 +3002,7 @@ def rotate_task(cfg, t, it, reason):
         pass
     ready = wait_ready(cfg, t["session_id"], t.get("trust", False))
     if ready == "update":
-        t["state"], t["note"] = "needs-you", codex_update_note(cfg, t, "nudge")
+        wait_for_codex_update(cfg, t, resume=True)
     elif ready != "ready":
         t["state"], t["note"] = "needs-you", L("the new session is not ready ({}): handle it in the session, then run chief.py nudge {}",
                                                "新会话没有就绪（{}）：进入会话处理后运行 chief.py nudge {}").format(ready, t["id"])
@@ -2808,6 +3097,8 @@ def review_task(cfg, t, it):
 
 def nudge(cfg, t, text=None, with_review=False):
     """Send the worker your guidance (or the review issues), clear stuck / limit notes and resume automation."""
+    if pending_codex_update(t):
+        raise RuntimeError("Codex kickoff is pending; accept its update card, or run chief kickoff when the session is ready")
     parts = []
     if text:
         parts.append("Message from the user: " + text)
@@ -2855,12 +3146,21 @@ def tick(cfg, dry=False):
             return [L("another tick is running; skipped", "另一个 tick 正在运行，跳过")]
         notified_tasks = set()
         done = [] if dry else drain_protected_notices(cfg, notified_tasks)
+        if not dry:
+            for task in all_tasks():
+                if task.get("state") in ACTIVE and pending_codex_update(task):
+                    try:
+                        if poll_codex_update(cfg, task):
+                            done.append(task["id"] + " · resumed after Codex update/menu dismissal")
+                    except RuntimeError:
+                        pass  # Another process owns the update; a later tick observes its result.
+                    notified_tasks.add(task["id"])
         result = collect(cfg, state_file=TICK)
         for it in result["items"]:
             t = it["task"]
             if not t.get("id"):
                 continue
-            if t.get("adopted") and t["id"] in notified_tasks:
+            if t["id"] in notified_tasks or pending_codex_update(t):
                 continue  # A queued decision notice already resumed this worker during this tick.
             try:
                 what = act(cfg, it, load_task(t["id"]), dry)
@@ -2879,7 +3179,8 @@ def load_json(path, default):
     except (OSError, ValueError):
         return default
 
-def collect(cfg, checks=True, persist=True, state_file=LAST):
+def collect(cfg, checks=True, persist=True, state_file=None):
+    state_file = LAST if state_file is None else state_file
     prev = load_json(state_file, {"items": []})
     ckcache = load_json(CHECKS, {})
     previt = {x["id"]: x for x in prev.get("items", [])}
@@ -2906,7 +3207,8 @@ def collect(cfg, checks=True, persist=True, state_file=LAST):
                 ds = load_decisions(task["id"])
                 if sync_protected_decisions(task, it, ds, now_utc().isoformat()):
                     save_decisions(task["id"], ds)
-                dec = next((d for d in ds if d["state"] == "pending" and is_protected_approval(d)), None)
+                dec = next((d for d in ds if d["state"] == "pending" and
+                            (d.get("kind") == "codex-update" or is_protected_approval(d))), None)
                 if dec:
                     it["decision"] = {k: dec.get(k) for k in ("id", "size", "question", "choice", "draft", "why", "by", "kind", "files", "snapshot")}
                     it["signals"] = decision_signals(it["signals"], dec, {})
@@ -2982,7 +3284,7 @@ def decision_signals(signals, dec, ft):
             out.append(("yellow", L("blocked (waiting for this decision): ", "阻塞（等这条决策）：") + clip(ft.get("blocker"), 160), k))
         else:
             out.append((l, m, k))
-    if is_protected_approval(dec) and not any(k == "decision" for _, _, k in out):
+    if (is_protected_approval(dec) or dec.get("kind") == "codex-update") and not any(k == "decision" for _, _, k in out):
         out.append(("red", L("decide {}: {}", "请你决定 {}：{}").format(dec["id"], dec["question"]), "decision"))
     return out
 
@@ -4009,11 +4311,20 @@ def main(argv=None):
                 ready = wait_ready(cfg, t["session_id"], False if t.get("adopted") else args.trust,
                                    timeout=0 if t.get("adopted") else 30)
                 if ready == "update":
-                    raise RuntimeError(codex_update_note(cfg, t))
+                    wait_for_codex_update(cfg, t)
+                    raise RuntimeError(t["note"])
                 if ready != "ready":
                     raise RuntimeError(L("the session is not ready (perhaps waiting for you to trust the folder); handle it in the session and retry",
                                          "会话还没就绪（可能在等你确认信任目录），进入会话处理后再试"))
-                send_kickoff(cfg, t)
+                if pending_codex_update(t):
+                    with codex_update_lock():
+                        t = load_task(t["id"])
+                        pending = pending_codex_update(t)
+                        if pending:
+                            pending.pop("delivery_attempted", None)
+                            resume_codex_update(cfg, t, False, "done-by-user")
+                else:
+                    send_kickoff(cfg, t)
             print(L("Task {} · {}", "任务 {} · {}").format(t["id"], t["state"]) + (L("\nNeeds you: ", "\n需要你：") + t["note"] if t.get("note") else ""))
         elif args.command == "clean":
             return clean_tasks(cfg, args.dry_run, args.branches)
@@ -4107,6 +4418,8 @@ def main(argv=None):
             d = find_decision(args.id)
             if d["state"] != "pending":
                 raise RuntimeError(L("{} is already {}", "{} 已经是 {} 状态").format(d["id"], d["state"]))
+            if d.get("kind") == "codex-update" and (args.redraft or args.ai):
+                raise RuntimeError("Codex update cards use codex_update_command; change the configuration instead of redrafting")
             if (args.redraft or args.ai) and is_protected_approval(d):
                 d["size"] = "big"
                 d.pop("draft", None)
@@ -4124,7 +4437,10 @@ def main(argv=None):
                 update_decision(d)
             if args.accept:
                 ok = accept_decision(cfg, d)
-                if is_protected_approval(d):
+                if d.get("kind") == "codex-update":
+                    print(L("Codex update complete; waiting workers resumed", "Codex 更新完成；等待中的 Worker 已继续") if ok else
+                          L("Codex update/resume needs attention; see the task note", "Codex 更新/继续需要处理；请查看任务说明"))
+                elif is_protected_approval(d):
                     print(protected_approval_message(d))
                 else:
                     print((L("Approved the acceptance tests", "已批准验收测试") if d.get("kind") == "test-approval" else
