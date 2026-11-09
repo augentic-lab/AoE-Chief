@@ -1,4 +1,4 @@
-"""Codex startup updates require the user; Chief must only observe the menu.
+"""Codex startup menus are observed without keys; Chief queues its own updater.
 
 Exercise the existing string-valued wait_ready interface and all three reporting
 paths. Only terminal/process boundaries are simulated; no detector API is imposed.
@@ -54,7 +54,7 @@ LAUNCH = "aoe-update-acceptance"
 
 
 @contextmanager
-def terminal(test, screens=REAL_SCREEN, status="waiting", launch=None, stop=False):
+def terminal(test, screens=REAL_SCREEN, status="waiting", launch=None, stop=False, version_probe=False):
     """Record every external action and forbid all keys/commands except setup.
 
     A fake clock makes broken detection fail promptly rather than waiting for a
@@ -76,6 +76,9 @@ def terminal(test, screens=REAL_SCREEN, status="waiting", launch=None, stop=Fals
         test.fail("unexpected AoE action (including start/send/upgrade): {!r}".format(args))
 
     def call(command, **kwargs):
+        if version_probe and command == ["/fixture/codex", "--version"]:
+            test.assertEqual(kwargs.get("timeout"), 15)
+            return "codex-cli 0.162.1\n"
         if launch is not None and command == launch:
             return "ID: {}\nPath: /tmp/update-acceptance-worktree\n".format(SID)
         test.fail("unexpected command (including keys or upgrade): {!r}".format(command))
@@ -268,7 +271,9 @@ class CodexUpdateMessageTests(ChiefFixture):
         if path != "start":
             task.update(state="running", session_id=OLD_SID if path == "rotate" else SID)
         chief.save_task(task)
+        chief.save_decisions(task["id"], [])  # Independent launch cases reuse this fixture task id.
         with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(chief.shutil, "which", return_value="/fixture/codex"))
             stack.enter_context(mock.patch.object(chief, "LANG", lang))
             stack.enter_context(mock.patch.object(chief, "aoe_bin", return_value=LAUNCH))
             stack.enter_context(mock.patch.object(chief, "add_command", return_value=[LAUNCH, "add", "--launch"]))
@@ -283,7 +288,8 @@ class CodexUpdateMessageTests(ChiefFixture):
             elif path == "rotate":
                 launch = [LAUNCH, "-p", self.cfg["profile"], "add", str(self.repo),
                           "-t", task["name"] + " #2", "--tool", "codex", "--launch"]
-            io = stack.enter_context(terminal(self, screens, launch=launch, stop=path == "rotate"))
+            io = stack.enter_context(terminal(self, screens, launch=launch, stop=path == "rotate",
+                                                version_probe=readiness == "update"))
             if path == "start":
                 result = chief.start_task(self.cfg, task, trust)
                 self.assertEqual(result["state"], "needs-you")
@@ -307,33 +313,35 @@ class CodexUpdateMessageTests(ChiefFixture):
         return message
 
     def assert_update_message(self, text, path, lang, versions=("0.162.1", "0.165.0")):
-        command = "chief.py {} codex-update".format("nudge" if path == "rotate" else "kickoff")
-        self.assertIn(command, text)
+        self.assertIn("chief decide codex-update:1 --accept", text)
         self.assertIn("Esc", text)
-        self.assertNotIn("chief.py {} codex-update".format("kickoff" if path == "rotate" else "nudge"), text)
         if lang == "en":
-            self.assertRegex(text, r"(?i)Codex[^.\n]*(?:offer|update)")
-            self.assertRegex(text, r"(?i)Chief\s+(?:will\s+)?never\s+(?:updat|upgrad)(?:e[sd]?|ing)[^.;\n]*skip")
-            self.assertRegex(text, r"(?i)(?:upgrad|updat)e\s+Codex\s+(?:yourself|manually)")
-            self.assertRegex(text, r"(?i)(?:skip|dismiss)[^.;\n]*Esc")
-            self.assertRegex(text, r"(?i)session")
+            self.assertRegex(text, r"(?i)Codex.*update")
+            self.assertIn("Chief never selects Update now", text)
+            self.assertIn("manual update", text)
+            self.assertIn("automatically on tick", text)
         else:
             self.assertRegex(text, r"Codex[^\n]*(?:更新|升级)")
-            self.assertRegex(text, r"Chief[^\n]*(?:从不|不会)[^\n]*(?:更新|升级)[^\n]*跳过")
-            self.assertRegex(text, r"(?:自行|自己|手动)[^\n]*(?:升级|更新)[^\n]*Codex")
-            self.assertRegex(text, r"会话[^\n]*(?:Esc[^\n]*跳过|跳过[^\n]*Esc)")
+            self.assertIn("Chief 不会选择 Update now", text)
+            self.assertIn("手动更新", text)
+            self.assertIn("tick 也会自动继续", text)
+        saved = chief.load_task("codex-update")
+        self.assertEqual(saved["state"], "needs-you")
+        pending = saved["pending_resume"]
+        self.assertEqual(pending["kind"], "codex-update")
+        self.assertEqual(pending["step"], "rotation-kickoff" if path == "rotate" else "kickoff")
+        cards = [d for d in chief.load_decisions("codex-update") if d["state"] == "pending"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["kind"], "codex-update")
+        self.assertIn("--prefix", cards[0]["choice"])
         if versions is None:
+            self.assertIsNone(pending["from"])
+            self.assertIsNone(pending["to"])
             self.assertNotRegex(text, r"\d+\.\d+\.\d+", "missing versions must never be invented")
-            self.assertNotRegex(text, r"(?i)\b(?:None|unknown|null)\s*(?:→|to)\s*(?:None|unknown|null)\b")
-            if lang == "en":
-                self.assertRegex(text, r"(?i)Codex\s+(?:is\s+)?offering\s+an?\s+update")
             return
         old, new = versions
-        self.assertRegex(text, re.escape(old) + r"[\s\S]*" + re.escape(new))
-        if lang == "en":
-            self.assertRegex(text, r"(?i)from\s+" + re.escape(old) + r"\s+to\s+" + re.escape(new))
-        else:
-            self.assertRegex(text, r"从\s*" + re.escape(old) + r"\s*(?:到|至|升级到|更新到)\s*" + re.escape(new))
+        self.assertEqual((pending["from"], pending["to"]), versions)
+        self.assertRegex(text, re.escape(old) + r"\s*→\s*" + re.escape(new))
 
     def test_all_three_paths_report_real_versions_policy_and_correct_recovery_in_both_languages(self):
         for path in ("start", "rotate", "kickoff"):
@@ -394,7 +402,7 @@ class CodexUpdateMessageTests(ChiefFixture):
 
 
 class CodexUpdateDocumentationTests(unittest.TestCase):
-    def test_readme_documents_menu_nonintervention_prefix_risk_and_recovery_commands(self):
+    def test_readme_documents_menu_nonintervention_prefix_and_automatic_recovery(self):
         text = read_documentation()
         # A short contiguous paragraph/list must connect the policy and recovery;
         # unrelated mentions elsewhere in this large README cannot satisfy it.
@@ -402,13 +410,12 @@ class CodexUpdateDocumentationTests(unittest.TestCase):
         self.assertIsNotNone(section, "document Codex's startup update menu")
         policy = " ".join(section.group(0).split())
         self.assertIn("Update available", policy)
-        self.assertRegex(policy, r"(?i)Chief[^\n]*(?:never|does not|won't)[^\n]*(?:updat|upgrad)[^\n]*skip")
-        self.assertIn("npm install -g @openai/codex", policy)
-        self.assertRegex(policy, r"(?i)prefix")
-        self.assertRegex(policy, r"(?i)(?:yourself|manually|user)")
+        self.assertIn("Chief sends no menu keys", policy)
+        self.assertIn("npm install -g @openai/codex@{version} --prefix ~/.npm-global", policy)
+        self.assertIn("never selected", policy)
+        self.assertIn("codex-update", policy)
         self.assertIn("Esc", policy)
-        self.assertIn("chief.py kickoff <id>", policy)
-        self.assertIn("chief.py nudge <id>", policy)
+        self.assertIn("automatically on tick", policy)
 
 
 if __name__ == "__main__":
