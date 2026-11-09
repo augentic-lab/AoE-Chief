@@ -16,6 +16,7 @@ Config lives in `$AOE_CHIEF_HOME/config.json` (default `~/.local/state/aoe-chief
 | `stuck_after`, `max_auto_continues`, `rotate_at` | 3, 8, 70 | Automation limits |
 | `presence_minutes` | 10 | Adopted tasks pause automatic messages while their latest human prompt is less than this many minutes old; `nudge` resumes immediately. Delegated tasks are unaffected |
 | `review`, `review_engine`, `review_level` | `true`, the other engine (Codex for Antigravity), 2 | Cross review using Codex or Claude |
+| `review_rounds` | 2 | Automatic returns of review issues per task before handing unresolved work to you; once per reviewed HEAD. `0` disables automatic returns. An acceptable review or manual `nudge` resets the round count |
 | `aoe_colors` | `true` | Mirror each task's state onto its AoE color dot: red needs you, amber working, green to accept |
 | `commands` | `{}` | Launch a tool through your own command, e.g. `{"claude": "claude-proxy"}`. See below |
 | `codex_update_command` | `["npm", "install", "-g", "@openai/codex@{version}", "--prefix", "~/.npm-global"]` | Update argv; `{version}` is the menu target, or `latest` when unknown. `~` expands. Runs only after accepting an update card, without a shell, with a 300-second timeout; no fallback installer |

@@ -147,6 +147,13 @@ See the [agreed design](design.md), [research worker rules](../rules/research.md
 
 ## Decisions and acceptance tests
 
+With cross review enabled, passing checks means **waiting for cross review** of the current HEAD.
+A pass without Issues is **ready to accept**; concerns without Issues is **ready with risks**, with the risks
+alongside it. Both are green. Any Issues or a fail verdict means **needs work**. When the worker is idle and
+no decision or user activity blocks automation, Chief returns Issues once per reviewed HEAD, up to
+`review_rounds` times (default 2); unresolved work after that, or a fail without Issues, needs you.
+Dry runs send nothing. With `review: false`, passing checks still means ready to accept.
+
 New tasks begin with a test phase: the worker writes failing acceptance tests, commits them, and asks you to
 approve the files. This is always a big decision with no Chief draft, including in auto mode. Accept it with
 `chief decide <decision-id> --accept` or the Inbox action **`a approve tests`** (**`a 批准测试`** in Chinese).
